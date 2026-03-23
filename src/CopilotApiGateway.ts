@@ -1774,6 +1774,15 @@ export class CopilotApiGateway implements vscode.Disposable {
 			}
 		}
 
+		// Admin endpoints
+		if (url.pathname.startsWith('/v1/admin/')) {
+			const { registerAdminEndpoints } = await import('./admin/adminEndpoints');
+			const handled = registerAdminEndpoints(this, req, res, url);
+			if (handled) {
+				return;
+			}
+		}
+
 		// List tools
 		if (req.method === 'GET' && url.pathname === '/v1/tools') {
 			let filters;
