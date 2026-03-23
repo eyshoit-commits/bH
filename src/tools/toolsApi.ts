@@ -34,3 +34,30 @@ export function buildToolsPayload(tools: CoreToolPreview[]): Record<string, unkn
 		total: tools.length
 	};
 }
+
+export interface ToolExecutionPayload {
+	toolId: string;
+	input: Record<string, unknown>;
+	context?: Record<string, unknown>;
+}
+
+export function parseToolExecutionBody(body: unknown): ToolExecutionPayload {
+	if (!body || typeof body !== 'object') {
+		throw new Error('Request body must be an object');
+	}
+	const entry = body as Record<string, unknown>;
+	const toolId = typeof entry.tool_id === 'string' && entry.tool_id.trim()
+		? entry.tool_id.trim()
+		: '';
+	if (!toolId) {
+		throw new Error('tool_id is required');
+	}
+	const input = entry.input && typeof entry.input === 'object'
+		? entry.input as Record<string, unknown>
+		: {};
+	const context = entry.context && typeof entry.context === 'object'
+		? entry.context as Record<string, unknown>
+		: undefined;
+
+	return { toolId, input, context };
+}

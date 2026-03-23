@@ -25,7 +25,8 @@ import { searchSkills, SearchError, type SearchParams } from './skills/search/se
 import { parseSearchParams } from './skills/search/parseSearchParams';
 import { getToolRegistry } from './tools/registry';
 import type { CoreToolPreview } from './tools/toolRegistry';
-import { buildToolsPayload, parseToolsFilters } from './tools/toolsApi';
+import { buildToolsPayload, parseToolExecutionBody, parseToolsFilters } from './tools/toolsApi';
+import { invokeSkillTool, ToolExecutionError } from './skills/runtime/invokeSkillTool';
 
 const COPILOT_CHAT_EXTENSION_ID = 'GitHub.copilot-chat';
 const COPILOT_CHAT_SEARCH_QUERY = '@id:GitHub.copilot-chat';
@@ -1767,6 +1768,28 @@ export class CopilotApiGateway implements vscode.Disposable {
 			const payload = buildToolsPayload(tools);
 			this.sendJson(res, 200, payload);
 			return;
+		}
+
+		// Execute a single tool
+		if (req.method === 'POST' && url.pathname === '/v1/tools/execute') {
+			const body = await parseJsonBody(req);
+			let payload;
+			try {
+				payload = parseToolExecutionBody(body);
+			} catch (error) {
+				throw new ApiError(400, error instanceof Error ? error.message : 'Invalid payload', 'invalid_param');
+			}
+
+			try {
+				const result = await invokeSkillTool(payload.toolId, { input: payload.input, context: payload.context });
+				this.sendJson(res, 200, result);
+				return;
+			} catch (error) {
+				if (error instanceof ToolExecutionError) {
+					throw new ApiError(400, error.message, 'execution_error');
+				}
+				throw error;
+			}
 		}
 
 		// Get specific model
