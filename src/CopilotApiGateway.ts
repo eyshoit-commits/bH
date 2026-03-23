@@ -20,6 +20,9 @@ import { mergeModels } from './gateway/model/mergeModels';
 import { normalizeModel, type NormalizeModelOptions, type NormalizedModel } from './gateway/model/normalizeModel';
 import { validateModel } from './gateway/model/validateModel';
 import { parseJsonBody } from './jsonBodyParser';
+import { buildSkillIndex } from './skills/search/buildSkillIndex';
+import { searchSkills, SearchError, type SearchParams } from './skills/search/searchSkills';
+import { parseSearchParams } from './skills/search/parseSearchParams';
 
 const COPILOT_CHAT_EXTENSION_ID = 'GitHub.copilot-chat';
 const COPILOT_CHAT_SEARCH_QUERY = '@id:GitHub.copilot-chat';
@@ -1707,6 +1710,38 @@ export class CopilotApiGateway implements vscode.Disposable {
 				data: skills
 			});
 			return;
+		}
+
+		// Search skills
+		if (req.method === 'GET' && url.pathname === '/v1/skills/search') {
+			let params: SearchParams;
+			try {
+				params = parseSearchParams(url.searchParams);
+			} catch (error) {
+				throw new ApiError(400, error instanceof Error ? error.message : 'Invalid search parameters', 'invalid_param');
+			}
+			const { getSkills } = await import('./skills/registry');
+			const skills = getSkills();
+			const snapshot = buildSkillIndex(skills);
+
+			try {
+				const result = searchSkills(params, snapshot);
+				const payload: Record<string, unknown> = {
+					skills: result.skills,
+					total: result.total,
+					tookMs: result.tookMs,
+				};
+				if (result.debug) {
+					payload.debug = result.debug;
+				}
+				this.sendJson(res, 200, payload);
+				return;
+			} catch (error) {
+				if (error instanceof SearchError) {
+					throw new ApiError(400, error.message, 'invalid_param');
+				}
+				throw error;
+			}
 		}
 
 		// Get specific model
