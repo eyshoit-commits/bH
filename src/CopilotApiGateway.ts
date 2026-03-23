@@ -23,6 +23,9 @@ import { parseJsonBody } from './jsonBodyParser';
 import { buildSkillIndex } from './skills/search/buildSkillIndex';
 import { searchSkills, SearchError, type SearchParams } from './skills/search/searchSkills';
 import { parseSearchParams } from './skills/search/parseSearchParams';
+import { getToolRegistry } from './tools/registry';
+import type { CoreToolPreview } from './tools/toolRegistry';
+import { buildToolsPayload, parseToolsFilters } from './tools/toolsApi';
 
 const COPILOT_CHAT_EXTENSION_ID = 'GitHub.copilot-chat';
 const COPILOT_CHAT_SEARCH_QUERY = '@id:GitHub.copilot-chat';
@@ -60,15 +63,18 @@ export async function selectChatModelsSafe(
 }
 
 export class ApiError extends Error {
-	constructor(
-		readonly status: number,
-		message: string,
-		readonly type: string,
-		readonly code?: string,
-		readonly details?: unknown,
-	) {
+	readonly status: number;
+	readonly type: string;
+	readonly code?: string;
+	readonly details?: unknown;
+
+	constructor(status: number, message: string, type: string, code?: string, details?: unknown) {
 		super(message);
 		this.name = 'ApiError';
+		this.status = status;
+		this.type = type;
+		this.code = code;
+		this.details = details;
 	}
 }
 
@@ -1742,6 +1748,25 @@ export class CopilotApiGateway implements vscode.Disposable {
 				}
 				throw error;
 			}
+		}
+
+		// List tools
+		if (req.method === 'GET' && url.pathname === '/v1/tools') {
+			let filters;
+			try {
+				filters = parseToolsFilters(url.searchParams);
+			} catch (error) {
+				throw new ApiError(400, error instanceof Error ? error.message : 'Invalid filters', 'invalid_param');
+			}
+
+			const toolRegistry = getToolRegistry();
+			const tools = toolRegistry.list({
+				skillId: filters.skillId,
+				toolType: filters.toolType
+			});
+			const payload = buildToolsPayload(tools);
+			this.sendJson(res, 200, payload);
+			return;
 		}
 
 		// Get specific model

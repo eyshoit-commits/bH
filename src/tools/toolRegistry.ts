@@ -121,6 +121,13 @@ export class ToolRegistry {
 		this.rejections.push(entry);
 	}
 
+	clear(): void {
+		this.toolsById.clear();
+		this.toolsBySkill.clear();
+		this.rejections = [];
+		this.lastRefresh = null;
+	}
+
 	private indexSkill(skillId: string, toolId: string): void {
 		let set = this.toolsBySkill.get(skillId);
 		if (!set) {
