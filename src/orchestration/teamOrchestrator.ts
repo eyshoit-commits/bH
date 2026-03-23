@@ -33,7 +33,9 @@ class TeamOrchestrator {
 
 	addStep(traceId: string, role: TeamRole, action: string, result: string): void {
 		const trace = this.traces.get(traceId);
-		if (!trace) return;
+		if (!trace) {
+			return;
+		}
 
 		const step: TraceStep = {
 			role,
@@ -47,7 +49,9 @@ class TeamOrchestrator {
 
 	completeTrace(traceId: string, success: boolean): void {
 		const trace = this.traces.get(traceId);
-		if (!trace) return;
+		if (!trace) {
+			return;
+		}
 
 		trace.status = success ? 'completed' : 'failed';
 		trace.completedAt = new Date().toISOString();
