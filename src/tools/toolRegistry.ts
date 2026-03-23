@@ -117,6 +117,10 @@ export class ToolRegistry {
 		return [...this.rejections];
 	}
 
+	recordRejection(entry: ToolRejection): void {
+		this.rejections.push(entry);
+	}
+
 	private indexSkill(skillId: string, toolId: string): void {
 		let set = this.toolsBySkill.get(skillId);
 		if (!set) {
