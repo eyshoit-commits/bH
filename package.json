@@ -1,0 +1,358 @@
+{
+  "name": "proxy",
+  "displayName": "proxy",
+  "description": "Free & open-source universal API Gateway for all VS Code language models. Auto-discovers GitHub Copilot, Gemini, Ollama & any AI extension — exposing them via local OpenAI, Anthropic, Google & Llama compatible APIs. One endpoint, every model. Use with Cursor, LangChain, Agents & more.",
+  "icon": "media/icon.png",
+  "version": "2.10.5",
+  "author": {
+    "name": "Suhaib Bin Younis",
+    "email": "vscode@suhaib.in",
+    "url": "https://suhaib.in"
+  },
+  "publisher": "proxy",
+  "homepage": "https://copilot-api.suhaib.in/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/suhaibbinyounis/github-copilot-api-vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/suhaibbinyounis/github-copilot-api-vscode/issues",
+    "email": "vscode@suhaib.in"
+  },
+  "sponsor": {
+    "url": "https://github.com/sponsors/suhaibbinyounis"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "AI",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "github copilot",
+    "openai",
+    "anthropic",
+    "claude",
+    "google",
+    "gemini",
+    "ollama",
+    "multi-provider",
+    "api",
+    "gateway",
+    "proxy",
+    "server",
+    "http",
+    "llm",
+    "ai",
+    "agent",
+    "agents",
+    "rag",
+    "langchain",
+    "cursor",
+    "aider",
+    "free",
+    "open-source"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri",
+    "onView:proxyControls",
+    "onCommand:proxy.showServerControls"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "workflow": "./workflow.sh",
+    "test": "vscode-test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "cloudflared": "^0.7.1",
+    "selfsigned": "^5.5.0",
+    "ws": "^8.19.0"
+  },
+  "overrides": {
+    "diff": "^8.0.3",
+    "serialize-javascript": "^7.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/vscode": "1.95.0",
+    "@types/ws": "^8.18.1",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.27.4",
+    "eslint": "10.0.3",
+    "npm-run-all": "^4.1.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.57.0"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "proxy.openCopilotChat",
+        "title": "proxy: Open Chat",
+        "category": "proxy"
+      },
+      {
+        "command": "proxy.askCopilot",
+        "title": "proxy: Ask",
+        "category": "proxy"
+      },
+      {
+        "command": "proxy.askSelectionWithCopilot",
+        "title": "proxy: Ask About Selection",
+        "category": "proxy"
+      },
+      {
+        "command": "proxy.showServerControls",
+        "title": "proxy: Controls",
+        "category": "proxy"
+      },
+      {
+        "command": "proxy.openDashboard",
+        "title": "proxy: Open Dashboard",
+        "category": "proxy"
+      },
+      {
+        "command": "proxy.createDesktopShortcut",
+        "title": "proxy: Create Desktop Shortcut",
+        "category": "proxy"
+      },
+      {
+        "command": "proxy.openSettings",
+        "title": "proxy: Open Settings",
+        "category": "proxy"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "proxy.askSelectionWithCopilot",
+          "group": "navigation@50",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "proxy-sidebar",
+          "title": "proxy",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "proxy-sidebar": [
+        {
+          "type": "webview",
+          "id": "proxyControls",
+          "name": "Controls"
+        }
+      ]
+    },
+    "configuration": {
+      "id": "githubCopilotApi",
+      "title": "proxy",
+      "type": "object",
+      "properties": {
+        "githubCopilotApi.server.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host interface used by the local Copilot-compatible HTTP server."
+        },
+        "githubCopilotApi.server.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable or disable the local proxy server."
+        },
+        "githubCopilotApi.server.enableHttp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose HTTP endpoints such as /v1/chat/completions."
+        },
+        "githubCopilotApi.server.enableWebSocket": {
+          "type": "boolean",
+          "default": false,
+          "description": "Expose the WebSocket realtime endpoint at /v1/realtime. Disabled by default to reduce resource usage."
+        },
+        "githubCopilotApi.server.enableHttps": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable HTTPS/TLS encryption for the API server. Auto-generates a self-signed certificate if no certificate paths are configured."
+        },
+        "githubCopilotApi.server.tlsCertPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the TLS/SSL certificate file (.pem or .crt)."
+        },
+        "githubCopilotApi.server.tlsKeyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the TLS/SSL private key file (.pem or .key)."
+        },
+        "githubCopilotApi.server.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start the proxy server when VS Code starts."
+        },
+        "githubCopilotApi.server.showNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show system notifications when the server starts or stops."
+        },
+        "githubCopilotApi.server.port": {
+          "type": "number",
+          "default": 3030,
+          "description": "Port used by the local Copilot-compatible HTTP server."
+        },
+        "githubCopilotApi.server.maxConcurrentRequests": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "description": "Maximum number of concurrent Copilot requests processed by the local API gateway."
+        },
+        "githubCopilotApi.server.defaultModel": {
+          "type": "string",
+          "default": "gpt-4o-copilot",
+          "description": "Default model identifier exposed by the OpenAI-compatible endpoints."
+        },
+        "githubCopilotApi.server.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API key for authentication. Leave empty to disable authentication. Clients must provide this as a Bearer token."
+        },
+        "githubCopilotApi.server.enableLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable request/response logging to the output channel for debugging."
+        },
+        "githubCopilotApi.server.rateLimitPerMinute": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "description": "Maximum number of requests per minute. Set to 0 to disable rate limiting."
+        },
+        "githubCopilotApi.server.defaultSystemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Default system prompt to inject if none is provided in the request."
+        },
+        "githubCopilotApi.server.customProviders": {
+          "type": "array",
+          "default": [],
+          "description": "Additional OpenAI-compatible providers merged into the model catalog.",
+          "items": {
+            "type": "object",
+            "required": ["name", "baseUrl", "models"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Display name for the custom provider."
+              },
+              "baseUrl": {
+                "type": "string",
+                "description": "OpenAI-compatible base URL, for example http://127.0.0.1:1234/v1."
+              },
+              "apiKey": {
+                "type": "string",
+                "default": "",
+                "description": "Optional API key or ${env:NAME} placeholder."
+              },
+              "models": {
+                "type": "array",
+                "description": "Model identifiers exposed by this provider.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether this custom provider is active."
+              },
+              "headers": {
+                "type": "object",
+                "default": {},
+                "description": "Optional static headers sent to the provider."
+              }
+            }
+          }
+        },
+        "githubCopilotApi.server.redactionPatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Regex patterns to redact sensitive information from request history. Each pattern is applied globally and case-insensitively."
+        },
+        "githubCopilotApi.server.ipAllowlist": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "List of allowed IP addresses or CIDR ranges. If empty, all IPs are allowed."
+        },
+        "githubCopilotApi.server.requestTimeoutSeconds": {
+          "type": "number",
+          "default": 180,
+          "minimum": 1,
+          "description": "Request timeout in seconds for proxy API calls."
+        },
+        "githubCopilotApi.server.maxPayloadSizeMb": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "description": "Maximum allowed request payload size in Megabytes (MB)."
+        },
+        "githubCopilotApi.server.maxConnectionsPerIp": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "Maximum number of concurrent connections allowed per IP address."
+        },
+        "githubCopilotApi.audit.retentionDays": {
+          "type": "number",
+          "default": 30,
+          "description": "Number of days to retain audit logs. Set to 0 to disable automatic deletion."
+        },
+        "githubCopilotApi.audit.logRequestBodies": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether to log full request and response bodies in the audit trail. WARNING: This may log sensitive data."
+        },
+        "githubCopilotApi.mcp.servers": {
+          "type": "object",
+          "default": {},
+          "description": "Configuration for MCP (Model Context Protocol) servers. Map server names to their configurations (command, args, env, or url for SSE)."
+        },
+        "githubCopilotApi.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable MCP support globally."
+        },
+        "githubCopilotApi.tunnel.cloudflaredPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom path to the cloudflared executable. If empty, the extension will attempt to use cloudflared from your system PATH, or download it automatically."
+        }
+      }
+    }
+  }
+}

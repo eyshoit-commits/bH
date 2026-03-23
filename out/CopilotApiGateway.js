@@ -1,0 +1,5663 @@
+import { randomUUID } from 'crypto';
+import { createServer } from 'http';
+import { createServer as createHttpsServer } from 'https';
+import * as os from 'os';
+import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import { AuditService } from './services/AuditService';
+import { normalizeOpenAICompatiblePath } from './openAiRouteAliases';
+import { buildResponsesCustomProviderChatPayload, extractChatCompletionTextContent, mapChatCompletionToResponsesApiResponse, } from './responsesCustomProviderBridge';
+import { parseJsonBody } from './jsonBodyParser';
+const COPILOT_CHAT_EXTENSION_ID = 'GitHub.copilot-chat';
+const COPILOT_CHAT_SEARCH_QUERY = '@id:GitHub.copilot-chat';
+const SELECT_CHAT_MODELS_TIMEOUT_MS = 2000;
+let cachedLanguageModels = [];
+let lastLanguageModelsWarningAt = 0;
+export async function selectChatModelsSafe(output, timeoutMs = SELECT_CHAT_MODELS_TIMEOUT_MS) {
+    try {
+        const models = await Promise.race([
+            vscode.lm.selectChatModels(),
+            new Promise((_, reject) => {
+                setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms while loading VS Code language models`)), timeoutMs);
+            })
+        ]);
+        cachedLanguageModels = models;
+        return models;
+    }
+    catch (error) {
+        if (cachedLanguageModels.length > 0) {
+            return cachedLanguageModels;
+        }
+        if (output) {
+            const now = Date.now();
+            if (now - lastLanguageModelsWarningAt > 5000) {
+                const message = error instanceof Error ? error.message : String(error);
+                output.appendLine(`[${new Date().toISOString()}] WARN Failed to load VS Code language models: ${message}`);
+                lastLanguageModelsWarningAt = now;
+            }
+        }
+        return [];
+    }
+}
+export class ApiError extends Error {
+    status;
+    type;
+    code;
+    details;
+    constructor(status, message, type, code, details) {
+        super(message);
+        this.status = status;
+        this.type = type;
+        this.code = code;
+        this.details = details;
+        this.name = 'ApiError';
+    }
+}
+// Default redaction patterns - disabled by default (opt-in)
+export const DEFAULT_REDACTION_PATTERNS = [
+    { id: 'ssn', name: 'US Social Security', pattern: '\\b\\d{3}-\\d{2}-\\d{4}\\b', enabled: false, isBuiltin: true },
+    { id: 'credit-card', name: 'Credit/Debit Card', pattern: '\\b(?:\\d{4}[- ]?){3}\\d{4}\\b', enabled: false, isBuiltin: true },
+    { id: 'aadhaar', name: 'Aadhaar Number', pattern: '\\b\\d{4}\\s?\\d{4}\\s?\\d{4}\\b', enabled: false, isBuiltin: true },
+    { id: 'passport-in', name: 'Indian Passport', pattern: '\\b[A-Z]\\d{7}\\b', enabled: false, isBuiltin: true },
+    { id: 'passport-us', name: 'US Passport', pattern: '\\b\\d{9}\\b', enabled: false, isBuiltin: true },
+    { id: 'email', name: 'Email Address', pattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}', enabled: false, isBuiltin: true },
+    { id: 'url', name: 'URLs', pattern: 'https?://[^\\s]+', enabled: false, isBuiltin: true },
+    { id: 'phone-us', name: 'US Phone Number', pattern: '\\b\\d{3}[-.]?\\d{3}[-.]?\\d{4}\\b', enabled: false, isBuiltin: true },
+    { id: 'phone-in', name: 'Indian Phone', pattern: '\\b[6-9]\\d{9}\\b', enabled: false, isBuiltin: true },
+    { id: 'api-key', name: 'API Keys', pattern: '(sk-[a-zA-Z0-9]{20,})|(api[_-]?key[=:]\\s*[\\w-]+)', enabled: false, isBuiltin: true },
+    { id: 'password-json', name: 'Passwords in JSON', pattern: '"password"\\s*:\\s*"[^"]*"', enabled: false, isBuiltin: true },
+    { id: 'bearer-token', name: 'Bearer Tokens', pattern: 'Bearer\\s+[A-Za-z0-9\\-._~+/]+=*', enabled: false, isBuiltin: true },
+];
+export class CopilotApiGateway {
+    output;
+    statusItem;
+    httpServer;
+    wsServer;
+    disposables = [];
+    config = getServerConfig();
+    disposed = false;
+    activeRequests = 0;
+    isHttps = false;
+    suppressRestart = false;
+    _onDidChangeStatus = new vscode.EventEmitter();
+    onDidChangeStatus = this._onDidChangeStatus.event;
+    _onDidLogRequest = new vscode.EventEmitter();
+    onDidLogRequest = this._onDidLogRequest.event;
+    _onDidLogRequestStart = new vscode.EventEmitter();
+    onDidLogRequestStart = this._onDidLogRequestStart.event;
+    customProviderModelCache = new Map();
+    CUSTOM_PROVIDER_CACHE_TTL_MS = 60_000;
+    // Domain cache for IP allowlist (maps domain names to resolved IPs)
+    domainCache = new Map();
+    domainRefreshInterval;
+    // Usage statistics
+    usageStats = {
+        totalRequests: 0,
+        totalTokensIn: 0,
+        totalTokensOut: 0,
+        requestsByEndpoint: {},
+        startTime: Date.now()
+    };
+    // Real-time stats with latency tracking
+    realtimeStats = {
+        requestsPerMinute: 0,
+        avgLatencyMs: 0,
+        latencyHistory: [],
+        tokensPerMinute: 0,
+        errorRate: 0,
+        lastMinuteRequests: [],
+        lastMinuteErrors: 0
+    };
+    // Request history (stored in memory, persisted to globalState)
+    requestHistory = [];
+    connections = new Set();
+    isShuttingDown = false;
+    MAX_HISTORY_SIZE = 100;
+    context;
+    // Rate limiting
+    rateLimitBucket = [];
+    // Request cache for deduplication
+    requestCache = new Map();
+    CACHE_TTL_MS = 5000; // 5 seconds
+    // Stats update interval
+    statsInterval;
+    // Production hardening
+    activeConnectionsPerIp = new Map();
+    auditService;
+    mcpService;
+    mcpInitPromise;
+    // Cloudflare Tunnel for internet access
+    tunnelUrl = null;
+    tunnelChild = null;
+    _onDidChangeTunnelStatus = new vscode.EventEmitter();
+    onDidChangeTunnelStatus = this._onDidChangeTunnelStatus.event;
+    constructor(output, statusItem, context) {
+        this.output = output;
+        this.statusItem = statusItem;
+        this.context = context;
+        this.auditService = new AuditService(context);
+        // MCP is loaded lazily when needed - no initialization here
+        // Timer intervals deferred to start() to not run when server is stopped
+        const subscription = vscode.workspace.onDidChangeConfiguration(event => {
+            if (event.affectsConfiguration('githubCopilotApi.server')) {
+                if (this.suppressRestart) {
+                    return;
+                }
+                void this.restart().catch(error => {
+                    this.logError('Failed to restart API server after configuration change', error);
+                });
+            }
+        });
+        this.disposables.push(subscription);
+        // Initialize stats from persistent storage (async, non-blocking)
+        this.initializeStats().catch(err => console.error('Failed to initialize stats:', err));
+        // Load request history (async, non-blocking)
+        setImmediate(() => this.loadHistory());
+    }
+    async initializeStats() {
+        try {
+            const lifetime = await this.auditService.getLifetimeStats();
+            this.usageStats.totalRequests = lifetime.totalRequests;
+            this.usageStats.totalTokensIn = lifetime.totalTokensIn;
+            this.usageStats.totalTokensOut = lifetime.totalTokensOut;
+        }
+        catch (error) {
+            console.error('Failed to load lifetime stats:', error);
+        }
+    }
+    /**
+     * Lazy-load MCP service only when needed
+     * Returns undefined if MCP is disabled
+     */
+    async ensureMcpService() {
+        const mcpEnabled = vscode.workspace.getConfiguration('githubCopilotApi.mcp').get('enabled', true);
+        if (!mcpEnabled) {
+            return undefined;
+        }
+        if (this.mcpService) {
+            return this.mcpService;
+        }
+        if (!this.mcpInitPromise) {
+            this.mcpInitPromise = (async () => {
+                const { McpService: McpServiceClass } = await import('./McpService');
+                this.mcpService = new McpServiceClass(this.output);
+                await this.mcpService.initialize();
+            })();
+        }
+        await this.mcpInitPromise;
+        return this.mcpService;
+    }
+    async getStatus() {
+        return {
+            running: !!this.httpServer,
+            isHttps: this.isHttps,
+            config: this.config,
+            activeRequests: this.activeRequests,
+            networkInfo: this.getNetworkInfo(),
+            stats: this.getStats(),
+            realtimeStats: this.realtimeStats,
+            historyCount: this.requestHistory.length,
+            mcp: this.getMcpStatus(),
+            copilot: await this.getCopilotHealth(),
+            tunnel: this.getTunnelStatus()
+        };
+    }
+    async getCopilotHealth() {
+        // More robust detection: scan all extensions for ID match (case-insensitive) or explicit name match
+        const allExtensions = vscode.extensions.all;
+        const copilotExt = allExtensions.find(e => e.id.toLowerCase() === 'github.copilot' ||
+            e.id.toLowerCase() === 'github.copilot-nightly' ||
+            (e.packageJSON?.publisher === 'GitHub' && e.packageJSON?.name === 'copilot'));
+        const copilotChatExt = allExtensions.find(e => e.id.toLowerCase() === 'github.copilot-chat' ||
+            (e.packageJSON?.publisher === 'GitHub' && e.packageJSON?.name === 'copilot-chat'));
+        let signedIn = false;
+        let allModels = [];
+        try {
+            allModels = await selectChatModelsSafe(this.output);
+            // Check if copilot models specifically are available
+            const copilotModels = allModels.filter(m => m.vendor === 'copilot');
+            signedIn = copilotModels.length > 0;
+        }
+        catch (e) {
+            signedIn = false;
+        }
+        // Gateway is ready if ANY language models are available (not just Copilot)
+        const hasAnyModels = allModels.length > 0;
+        const isReady = hasAnyModels || signedIn;
+        // Collect unique vendors for status reporting
+        const vendors = [...new Set(allModels.map(m => m.vendor))];
+        return {
+            installed: !!copilotExt || signedIn,
+            chatInstalled: !!copilotChatExt || signedIn,
+            signedIn: signedIn,
+            ready: isReady,
+            totalModels: allModels.length,
+            vendors
+        };
+    }
+    getMcpStatus() {
+        return {
+            enabled: vscode.workspace.getConfiguration('githubCopilotApi.mcp').get('enabled', true),
+            servers: this.mcpService?.getConnectedServers() ?? [],
+            tools: this.mcpService?.getTools() ?? []
+        };
+    }
+    /**
+     * Get combined usage statistics
+     */
+    getStats() {
+        return {
+            ...this.usageStats,
+            uptimeMs: Date.now() - this.usageStats.startTime,
+            avgLatencyMs: this.realtimeStats.avgLatencyMs,
+            requestsPerMinute: this.realtimeStats.requestsPerMinute,
+            errorRate: this.realtimeStats.errorRate,
+            mcp: this.getMcpStatus()
+        };
+    }
+    /**
+     * Get request history (optionally filtered)
+     */
+    getHistory(limit) {
+        const entries = [...this.requestHistory].reverse(); // Most recent first
+        return limit ? entries.slice(0, limit) : entries;
+    }
+    async getDailyStats(days) {
+        return this.auditService.getDailyStats(days);
+    }
+    async getAuditLogs(page, pageSize) {
+        return this.auditService.getLogEntries(page, pageSize);
+    }
+    getLogFolderPath() {
+        return this.auditService.getLogFolderPath();
+    }
+    /**
+     * Clear request history
+     */
+    clearHistory() {
+        this.requestHistory = [];
+        this.saveHistory();
+        this._onDidChangeStatus.fire();
+    }
+    /**
+     * Load request history from persistent storage
+     */
+    loadHistory() {
+        if (!this.context) {
+            return;
+        }
+        const saved = this.context.globalState.get('requestHistory', []);
+        this.requestHistory = saved.slice(-this.MAX_HISTORY_SIZE);
+    }
+    /**
+     * Save request history to persistent storage
+     */
+    saveHistory() {
+        if (!this.context) {
+            return;
+        }
+        void this.context.globalState.update('requestHistory', this.requestHistory.slice(-this.MAX_HISTORY_SIZE));
+    }
+    /**
+     * Add entry to request history
+     */
+    addHistoryEntry(entry) {
+        // Apply redaction patterns
+        const redactedEntry = this.redactSensitiveData(entry);
+        this.requestHistory.push(redactedEntry);
+        // Trim to max size
+        if (this.requestHistory.length > this.MAX_HISTORY_SIZE) {
+            this.requestHistory = this.requestHistory.slice(-this.MAX_HISTORY_SIZE);
+        }
+        // Save periodically (every 10 entries to avoid too frequent writes)
+        if (this.requestHistory.length % 10 === 0) {
+            this.saveHistory();
+        }
+        this._onDidChangeStatus.fire();
+    }
+    /**
+     * Apply redaction patterns to sensitive data
+     */
+    redactSensitiveData(data) {
+        const enabledPatterns = this.config.redactionPatterns.filter(p => p.enabled);
+        console.log(`[Redaction] ${this.config.redactionPatterns.length} total patterns, ${enabledPatterns.length} enabled`);
+        if (!enabledPatterns.length) {
+            return data;
+        }
+        const redact = (str) => {
+            let result = str;
+            for (const patternObj of enabledPatterns) {
+                try {
+                    const regex = new RegExp(patternObj.pattern, 'gi');
+                    result = result.replace(regex, '[REDACTED]');
+                }
+                catch {
+                    // Invalid regex, skip
+                }
+            }
+            return result;
+        };
+        const redactObject = (obj) => {
+            if (typeof obj === 'string') {
+                return redact(obj);
+            }
+            if (Array.isArray(obj)) {
+                return obj.map(redactObject);
+            }
+            if (obj && typeof obj === 'object') {
+                const result = {};
+                for (const [key, value] of Object.entries(obj)) {
+                    result[key] = redactObject(value);
+                }
+                return result;
+            }
+            return obj;
+        };
+        return redactObject(data);
+    }
+    /**
+     * Redact sensitive content from chat messages BEFORE sending to Copilot
+     * This prevents confidential data from ever leaving the user's machine
+     */
+    redactMessagesContent(messages) {
+        const enabledPatterns = this.config.redactionPatterns.filter(p => p.enabled);
+        if (!enabledPatterns.length) {
+            return messages;
+        }
+        const redactString = (str) => {
+            let result = str;
+            for (const patternObj of enabledPatterns) {
+                try {
+                    const regex = new RegExp(patternObj.pattern, 'gi');
+                    result = result.replace(regex, '[REDACTED]');
+                }
+                catch {
+                    // Invalid regex, skip
+                }
+            }
+            return result;
+        };
+        return messages.map(msg => {
+            let content = msg.content;
+            if (typeof content === 'string') {
+                content = redactString(content);
+            }
+            else if (Array.isArray(content)) {
+                // Handle array content (multi-modal messages)
+                content = content.map(part => {
+                    if (typeof part === 'string') {
+                        return redactString(part);
+                    }
+                    if (part && typeof part === 'object' && typeof part.text === 'string') {
+                        return { ...part, text: redactString(part.text) };
+                    }
+                    return part;
+                });
+            }
+            return { ...msg, content };
+        });
+    }
+    /**
+     * Redact a simple string prompt before sending to Copilot
+     */
+    redactPromptString(prompt) {
+        const enabledPatterns = this.config.redactionPatterns.filter(p => p.enabled);
+        if (!enabledPatterns.length) {
+            return prompt;
+        }
+        let result = prompt;
+        for (const patternObj of enabledPatterns) {
+            try {
+                const regex = new RegExp(patternObj.pattern, 'gi');
+                result = result.replace(regex, '[REDACTED]');
+            }
+            catch {
+                // Invalid regex, skip
+            }
+        }
+        return result;
+    }
+    /**
+     * Start the real-time stats updater
+     */
+    startStatsUpdater() {
+        // Update stats every 5 seconds
+        this.statsInterval = setInterval(() => {
+            this.updateRealtimeStats();
+            this._onDidChangeStatus.fire();
+        }, 5000);
+    }
+    /**
+     * Start periodic domain cache refresh for IP allowlist
+     */
+    startDomainCacheRefresh() {
+        // Refresh immediately on startup
+        void this.refreshDomainCache();
+        // Then refresh every 5 minutes
+        this.domainRefreshInterval = setInterval(() => {
+            void this.refreshDomainCache();
+        }, 5 * 60 * 1000);
+    }
+    /**
+     * Update real-time statistics
+     */
+    updateRealtimeStats() {
+        const now = Date.now();
+        const oneMinuteAgo = now - 60000;
+        // Clean old latency data
+        this.realtimeStats.latencyHistory = this.realtimeStats.latencyHistory.filter(entry => entry.timestamp > oneMinuteAgo);
+        // Clean old request timestamps
+        this.realtimeStats.lastMinuteRequests = this.realtimeStats.lastMinuteRequests.filter(ts => ts > oneMinuteAgo);
+        // Calculate requests per minute
+        this.realtimeStats.requestsPerMinute = this.realtimeStats.lastMinuteRequests.length;
+        // Calculate average latency
+        if (this.realtimeStats.latencyHistory.length > 0) {
+            const sum = this.realtimeStats.latencyHistory.reduce((acc, entry) => acc + entry.latency, 0);
+            this.realtimeStats.avgLatencyMs = Math.round(sum / this.realtimeStats.latencyHistory.length);
+        }
+        else {
+            this.realtimeStats.avgLatencyMs = 0;
+        }
+        // Calculate error rate (errors in last minute / requests in last minute)
+        if (this.realtimeStats.lastMinuteRequests.length > 0) {
+            this.realtimeStats.errorRate = Math.round((this.realtimeStats.lastMinuteErrors / this.realtimeStats.lastMinuteRequests.length) * 100);
+        }
+        else {
+            this.realtimeStats.errorRate = 0;
+        }
+        // Reset minute error counter periodically
+        if (this.realtimeStats.lastMinuteRequests.length === 0) {
+            this.realtimeStats.lastMinuteErrors = 0;
+        }
+    }
+    /**
+     * Record a completed request for stats
+     */
+    recordRequestStats(latencyMs, tokensIn, tokensOut, isError) {
+        const now = Date.now();
+        // Update usage stats
+        this.usageStats.totalRequests++;
+        this.usageStats.totalTokensIn += tokensIn;
+        this.usageStats.totalTokensOut += tokensOut;
+        // Update real-time stats
+        this.realtimeStats.lastMinuteRequests.push(now);
+        this.realtimeStats.latencyHistory.push({ timestamp: now, latency: latencyMs });
+        if (isError) {
+            this.realtimeStats.lastMinuteErrors++;
+        }
+        // Tokens per minute approximation
+        this.realtimeStats.tokensPerMinute = Math.round((this.usageStats.totalTokensIn + this.usageStats.totalTokensOut) /
+            Math.max(1, (now - this.usageStats.startTime) / 60000));
+        // Recompute immediately so dashboard traffic cards reflect the completed request
+        // instead of waiting for the periodic 5s updater.
+        this.updateRealtimeStats();
+    }
+    /**
+     * Add a custom redaction pattern
+     */
+    async addRedactionPattern(name, pattern) {
+        try {
+            new RegExp(pattern); // Validate regex
+            const patterns = this.config.redactionPatterns;
+            const id = `custom-${Date.now()}`;
+            const newPattern = {
+                id,
+                name,
+                pattern,
+                enabled: true,
+                isBuiltin: false
+            };
+            await this.updateServerConfig({ redactionPatterns: [...patterns, newPattern] });
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
+     * Remove a redaction pattern by ID
+     */
+    async removeRedactionPattern(id) {
+        const patterns = this.config.redactionPatterns.filter(p => p.id !== id);
+        await this.updateServerConfig({ redactionPatterns: patterns });
+    }
+    /**
+     * Toggle a redaction pattern on/off
+     */
+    async toggleRedactionPattern(id, enabled) {
+        const patterns = this.config.redactionPatterns.map(p => p.id === id ? { ...p, enabled } : p);
+        await this.updateServerConfig({ redactionPatterns: patterns });
+    }
+    /**
+     * Get current redaction patterns
+     */
+    getRedactionPatterns() {
+        return [...this.config.redactionPatterns];
+    }
+    /**
+     * Add an IP allowlist entry
+     */
+    async addIpAllowlistEntry(entry) {
+        const value = entry.trim();
+        if (!value) {
+            return false;
+        }
+        // Validation: allow IPs, CIDRs, and domain names
+        // IP/CIDR: digits, dots, colons, slashes
+        // Domain: alphanumeric, dots, hyphens (must have at least one dot for domains)
+        const isIpOrCidr = /^[\d\.\/]+$|^[\da-fA-F:\/]+$/.test(value);
+        const isDomain = /^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$/.test(value);
+        if (!isIpOrCidr && !isDomain) {
+            return false;
+        }
+        const list = [...this.config.ipAllowlist, value];
+        const config = vscode.workspace.getConfiguration('githubCopilotApi');
+        await config.update('server.ipAllowlist', list, vscode.ConfigurationTarget.Global);
+        return true;
+    }
+    /**
+     * Remove an IP allowlist entry
+     */
+    async removeIpAllowlistEntry(ipOrCidr) {
+        const ips = this.config.ipAllowlist.filter(ip => ip !== ipOrCidr);
+        await this.updateServerConfig({ ipAllowlist: ips });
+    }
+    /**
+     * Get network information when bound to 0.0.0.0 (all interfaces)
+     * Returns hostname and local IP addresses that can be shared with others
+     */
+    getNetworkInfo() {
+        if (this.config.host !== '0.0.0.0') {
+            return null;
+        }
+        const hostname = os.hostname();
+        const localIPs = [];
+        const interfaces = os.networkInterfaces();
+        for (const name of Object.keys(interfaces)) {
+            const netInterface = interfaces[name];
+            if (!netInterface) {
+                continue;
+            }
+            for (const info of netInterface) {
+                // Skip internal/loopback and IPv6 addresses for simplicity
+                if (!info.internal && info.family === 'IPv4') {
+                    localIPs.push(info.address);
+                }
+            }
+        }
+        return { hostname, localIPs };
+    }
+    async startServer() {
+        await this.updateServerConfig({ enabled: true });
+    }
+    async stopServer() {
+        await this.updateServerConfig({ enabled: false });
+    }
+    async toggleHttp() {
+        await this.updateServerConfig({ enableHttp: !this.config.enableHttp, enabled: true });
+    }
+    async toggleWebSocket() {
+        await this.updateServerConfig({ enableWebSocket: !this.config.enableWebSocket, enabled: true });
+    }
+    async toggleLogging() {
+        await this.updateServerConfig({ enableLogging: !this.config.enableLogging });
+    }
+    getAuditService() {
+        return this.auditService;
+    }
+    getServerStatus() {
+        return {
+            activeConnections: this.connections.size
+        };
+    }
+    async toggleHttps() {
+        await this.updateServerConfig({ enableHttps: !this.config.enableHttps, enabled: true });
+    }
+    async setApiKey(apiKey) {
+        const value = (apiKey ?? '').trim();
+        await this.updateServerConfig({ apiKey: value });
+    }
+    async setRateLimit(limit) {
+        const normalized = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 60;
+        await this.updateServerConfig({ rateLimitPerMinute: normalized });
+    }
+    getVersion() {
+        return this.context?.extension.packageJSON.version || '0.0.1';
+    }
+    async setHost(host) {
+        const value = (host ?? '').trim();
+        if (!value) {
+            return;
+        }
+        await this.updateServerConfig({ host: value, enabled: true });
+    }
+    async setPort(port) {
+        const normalized = Number.isFinite(port) ? Math.max(1, Math.min(65535, Math.floor(port))) : this.config.port;
+        await this.updateServerConfig({ port: normalized, enabled: true });
+    }
+    async toggleMcp(enabled) {
+        this.suppressRestart = true;
+        await vscode.workspace.getConfiguration('githubCopilotApi.mcp').update('enabled', enabled, vscode.ConfigurationTarget.Global);
+        if (enabled) {
+            const mcp = await this.ensureMcpService();
+            await mcp?.refreshServers();
+        }
+        this.config.mcpEnabled = enabled;
+        this.suppressRestart = false;
+        this._onDidChangeStatus.fire();
+    }
+    async setDefaultModel(model) {
+        const value = (model ?? '').trim();
+        if (!value) {
+            return;
+        }
+        await this.updateServerConfig({ defaultModel: value, enabled: true });
+    }
+    async setRequestTimeout(seconds) {
+        const normalized = Number.isFinite(seconds) ? Math.max(1, Math.floor(seconds)) : 180;
+        await this.updateServerConfig({ requestTimeoutSeconds: normalized });
+    }
+    async setMaxPayloadSize(mb) {
+        const normalized = Number.isFinite(mb) ? Math.max(1, Math.floor(mb)) : 1;
+        await this.updateServerConfig({ maxPayloadSizeMb: normalized });
+    }
+    async setMaxConnectionsPerIp(limit) {
+        const normalized = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 10;
+        await this.updateServerConfig({ maxConnectionsPerIp: normalized });
+    }
+    async setCloudflaredPath(path) {
+        await this.updateServerConfig({ cloudflaredPath: path });
+    }
+    async setMaxConcurrency(limit) {
+        const normalized = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 4;
+        await this.updateServerConfig({ maxConcurrentRequests: normalized });
+    }
+    getCustomProviders() {
+        return [...this.config.customProviders];
+    }
+    async setCustomProviders(providers) {
+        await this.updateServerConfig({ customProviders: providers });
+    }
+    async fetchCustomProviderModels(provider) {
+        const response = await fetch(`${provider.baseUrl}/models`, {
+            method: 'GET',
+            headers: this.getCustomProviderHeaders(provider)
+        });
+        if (!response.ok) {
+            const text = await response.text();
+            throw new ApiError(response.status, text || `Could not fetch models from ${provider.name}.`, 'bad_gateway', 'custom_provider_error');
+        }
+        const payload = await response.json();
+        const models = Array.isArray(payload?.data) ? payload.data : [];
+        return models
+            .map(model => {
+            const id = typeof model?.id === 'string' ? model.id.trim() : '';
+            const name = typeof model?.name === 'string' ? model.name.trim() : id;
+            if (!id) {
+                return null;
+            }
+            return { id, name: name || id };
+        })
+            .filter((model) => model !== null);
+    }
+    async testCustomProvider(provider) {
+        await this.fetchCustomProviderModels(provider);
+    }
+    // =====================
+    // Cloudflare Tunnel
+    // =====================
+    /**
+     * Get current tunnel status
+     */
+    getTunnelStatus() {
+        return {
+            running: this.tunnelChild !== null,
+            url: this.tunnelUrl
+        };
+    }
+    /**
+     * Start Cloudflare Quick Tunnel to expose the API to internet
+     * Requires: Server running + API key configured (for security)
+     */
+    async startTunnel() {
+        // Validate preconditions
+        if (!this.httpServer) {
+            return { success: false, error: 'Server must be running before starting tunnel' };
+        }
+        if (!this.config.apiKey) {
+            return { success: false, error: 'Authentication (API key) must be enabled for security when exposing to internet' };
+        }
+        if (this.tunnelChild) {
+            return { success: true, url: this.tunnelUrl ?? undefined };
+        }
+        try {
+            this.logInfo('Starting Cloudflare tunnel...');
+            // Use the cloudflared npm package
+            const { Tunnel, use, install } = await import('cloudflared');
+            const fs = await import('fs');
+            const path = await import('path');
+            // Use globalStorageUri for the binary (persists across extension updates)
+            const globalStoragePath = this.context?.globalStorageUri?.fsPath;
+            if (!globalStoragePath) {
+                return { success: false, error: 'Extension context not available' };
+            }
+            // Ensure the storage directory exists
+            if (!fs.existsSync(globalStoragePath)) {
+                fs.mkdirSync(globalStoragePath, { recursive: true });
+            }
+            let cloudflaredBin = '';
+            const customPath = this.config.cloudflaredPath;
+            // 1. Check custom configured path
+            if (customPath && fs.existsSync(customPath)) {
+                this.logInfo(`Using custom cloudflared path from configuration: ${customPath}`);
+                cloudflaredBin = customPath;
+            }
+            // 2. Check system PATH
+            else {
+                const { execSync } = await import('child_process');
+                try {
+                    const sysPath = execSync(process.platform === 'win32' ? 'where cloudflared' : 'which cloudflared').toString().split('\n')[0].trim();
+                    if (sysPath && fs.existsSync(sysPath)) {
+                        this.logInfo(`Found cloudflared in system PATH: ${sysPath}`);
+                        cloudflaredBin = sysPath;
+                    }
+                }
+                catch (e) {
+                    // cloudflared not in PATH
+                }
+            }
+            // 3. Fallback to downloading or using cached binary
+            if (!cloudflaredBin) {
+                cloudflaredBin = path.join(globalStoragePath, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
+                if (!fs.existsSync(cloudflaredBin)) {
+                    this.logInfo('Cloudflared binary not found locally or in PATH, downloading...');
+                    try {
+                        await install(cloudflaredBin);
+                        this.logInfo('Cloudflared binary downloaded successfully');
+                    }
+                    catch (downloadError) {
+                        const errMsg = downloadError instanceof Error ? downloadError.message : String(downloadError);
+                        this.logError('Failed to download cloudflared binary', downloadError);
+                        return { success: false, error: `Failed to download cloudflared: ${errMsg}. Check your internet connection.` };
+                    }
+                }
+                else {
+                    this.logInfo(`Using cached cloudflared binary: ${cloudflaredBin}`);
+                }
+            }
+            else {
+                this.logInfo(`Using chosen cloudflared binary: ${cloudflaredBin}`);
+            }
+            use(cloudflaredBin);
+            const localUrl = `http://${this.config.host === '0.0.0.0' ? '127.0.0.1' : this.config.host}:${this.config.port}`;
+            // Create a quick tunnel (no Cloudflare account needed)
+            const tunnelInstance = Tunnel.quick(localUrl);
+            // Store the process for cleanup
+            this.tunnelChild = tunnelInstance.process;
+            // Wait for the tunnel URL
+            const tunnelUrl = await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    reject(new Error('Timeout waiting for tunnel URL (30s)'));
+                }, 30000);
+                tunnelInstance.once('url', (url) => {
+                    clearTimeout(timeout);
+                    resolve(url);
+                });
+                tunnelInstance.once('error', (err) => {
+                    clearTimeout(timeout);
+                    reject(err);
+                });
+            });
+            this.tunnelUrl = tunnelUrl;
+            this.logInfo(`Cloudflare tunnel started: ${tunnelUrl}`);
+            this._onDidChangeTunnelStatus.fire({ running: true, url: tunnelUrl });
+            this._onDidChangeStatus.fire();
+            // Handle tunnel exit
+            tunnelInstance.on('exit', (code) => {
+                this.logInfo(`Cloudflare tunnel exited with code ${code}`);
+                this.tunnelChild = null;
+                this.tunnelUrl = null;
+                this._onDidChangeTunnelStatus.fire({ running: false, url: null });
+                this._onDidChangeStatus.fire();
+            });
+            return { success: true, url: tunnelUrl };
+        }
+        catch (error) {
+            const errMessage = error instanceof Error ? error.message : String(error);
+            this.logError('Failed to start Cloudflare tunnel', error);
+            this.tunnelChild = null;
+            this.tunnelUrl = null;
+            return { success: false, error: `Failed to start tunnel: ${errMessage}. Make sure cloudflared is installed or the extension can download it.` };
+        }
+    }
+    /**
+     * Stop the Cloudflare tunnel
+     */
+    async stopTunnel() {
+        if (!this.tunnelChild) {
+            return;
+        }
+        this.logInfo('Stopping Cloudflare tunnel...');
+        try {
+            // Try graceful shutdown first
+            this.tunnelChild.kill('SIGTERM');
+            // Wait briefly for graceful exit
+            await new Promise((resolve) => {
+                const timeout = setTimeout(() => {
+                    // Force kill if still running
+                    if (this.tunnelChild) {
+                        this.tunnelChild.kill('SIGKILL');
+                    }
+                    resolve();
+                }, 2000);
+                if (this.tunnelChild) {
+                    this.tunnelChild.once('exit', () => {
+                        clearTimeout(timeout);
+                        resolve();
+                    });
+                }
+                else {
+                    clearTimeout(timeout);
+                    resolve();
+                }
+            });
+        }
+        catch (error) {
+            this.logError('Error stopping tunnel', error);
+        }
+        this.tunnelChild = null;
+        this.tunnelUrl = null;
+        this._onDidChangeTunnelStatus.fire({ running: false, url: null });
+        this._onDidChangeStatus.fire();
+        this.logInfo('Cloudflare tunnel stopped');
+    }
+    async start() {
+        if (this.disposed) {
+            return;
+        }
+        // Start intervals only when server starts (deferred from constructor)
+        this.startStatsUpdater();
+        this.startDomainCacheRefresh();
+        await this.stop();
+        this.config = getServerConfig();
+        if (!this.config.enabled) {
+            this.updateStatusBar('stopped', 'Server disabled in settings');
+            this._onDidChangeStatus.fire();
+            return;
+        }
+        this.updateStatusBar('starting');
+        this._onDidChangeStatus.fire();
+        // Create request handler function
+        const requestHandler = (req, res) => {
+            // Track active connections for graceful shutdown
+            this.connections.add(res);
+            res.on('close', () => this.connections.delete(res));
+            const requestStart = Date.now();
+            const requestId = randomUUID().slice(0, 8);
+            // Fire start event immediately for Live Log Tail to show pending request
+            this._onDidLogRequestStart.fire({
+                requestId,
+                method: req.method || 'UNKNOWN',
+                path: req.url || '/',
+                timestamp: new Date().toISOString()
+            });
+            void this.handleHttpRequest(req, res, requestId, requestStart)
+                .catch(error => {
+                const duration = Date.now() - requestStart;
+                if (error instanceof ApiError) {
+                    this.logRequest(requestId, req.method || 'UNKNOWN', req.url || '/', error.status, duration, {
+                        error: error.message,
+                        requestHeaders: req.headers
+                    });
+                    this.sendError(res, error);
+                }
+                else {
+                    this.logRequest(requestId, req.method || 'UNKNOWN', req.url || '/', 500, duration, {
+                        error: error instanceof Error ? error.message : String(error),
+                        requestHeaders: req.headers
+                    });
+                    this.logError('Unhandled error in HTTP request handler', error);
+                    this.sendError(res, new ApiError(500, 'An unexpected error occurred.', 'server_error'));
+                }
+            })
+                .finally(() => {
+                this.activeRequests--;
+                this._onDidChangeStatus.fire();
+            });
+            this.activeRequests++;
+            this._onDidChangeStatus.fire();
+        };
+        // Create HTTP or HTTPS server based on config
+        let isHttps = false;
+        if (this.config.enableHttps) {
+            try {
+                let certData = null;
+                // Check if user provided cert paths
+                if (this.config.tlsCertPath && this.config.tlsKeyPath) {
+                    const certPath = this.config.tlsCertPath.startsWith('~')
+                        ? path.join(os.homedir(), this.config.tlsCertPath.slice(1))
+                        : this.config.tlsCertPath;
+                    const keyPath = this.config.tlsKeyPath.startsWith('~')
+                        ? path.join(os.homedir(), this.config.tlsKeyPath.slice(1))
+                        : this.config.tlsKeyPath;
+                    if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+                        certData = {
+                            cert: fs.readFileSync(certPath),
+                            key: fs.readFileSync(keyPath)
+                        };
+                        this.logInfo(`HTTPS enabled with certificate from ${certPath}`);
+                    }
+                }
+                // Auto-generate self-signed cert if no cert configured
+                if (!certData) {
+                    const selfsigned = require('selfsigned');
+                    const attrs = [{ name: 'commonName', value: 'localhost' }];
+                    const pems = selfsigned.generate(attrs, {
+                        days: 365,
+                        keySize: 2048,
+                        algorithm: 'sha256'
+                    });
+                    certData = {
+                        cert: pems.cert,
+                        key: pems.private
+                    };
+                    this.logInfo('HTTPS enabled with auto-generated self-signed certificate (valid 365 days)');
+                }
+                this.httpServer = createHttpsServer(certData, requestHandler);
+                isHttps = true;
+            }
+            catch (error) {
+                this.logError('Failed to setup HTTPS, falling back to HTTP', error);
+                this.httpServer = createServer(requestHandler);
+            }
+        }
+        else {
+            this.httpServer = createServer(requestHandler);
+        }
+        // Track actual runtime protocol
+        this.isHttps = isHttps;
+        this.httpServer.on('error', error => {
+            this.logError('HTTP server error', error);
+        });
+        // Only load WebSocket server when enabled
+        if (this.config.enableWebSocket) {
+            const { WebSocketServer: WSServer } = await import('ws');
+            this.wsServer = new WSServer({ noServer: true });
+            this.wsServer.on('error', (error) => {
+                this.logError('WebSocket server error', error);
+            });
+            // Define supported WebSocket endpoints
+            const wsEndpoints = [
+                '/v1/realtime', // OpenAI format
+                '/anthropic/v1/realtime', // Anthropic format
+                '/google/v1/realtime', // Google format
+                '/llama/v1/realtime' // Llama format
+            ];
+            this.httpServer.on('upgrade', (request, socket, head) => {
+                if (!request.url) {
+                    socket.destroy();
+                    return;
+                }
+                const url = this.buildUrl(request.url);
+                const endpoint = wsEndpoints.find(ep => url.pathname === ep);
+                if (endpoint) {
+                    this.wsServer?.handleUpgrade(request, socket, head, (ws) => {
+                        // Attach endpoint info to the socket for routing
+                        ws._endpoint = endpoint;
+                        this.handleWebSocketConnection(ws, endpoint);
+                    });
+                }
+                else {
+                    socket.destroy();
+                }
+            });
+        }
+        await new Promise((resolve, reject) => {
+            const onError = (error) => {
+                this.httpServer?.off('error', onError);
+                reject(error);
+            };
+            this.httpServer?.once('error', onError);
+            this.httpServer?.listen(this.config.port, this.config.host, () => {
+                this.httpServer?.off('error', onError);
+                resolve();
+            });
+        });
+        const address = this.httpServer.address();
+        if (address) {
+            const protocol = isHttps ? 'https' : 'http';
+            const location = `${protocol}://${address.address}:${address.port}`;
+            this.logInfo(`${isHttps ? 'HTTPS' : 'HTTP'} server listening on ${location}`);
+            this.updateStatusBar('running', `${isHttps ? 'HTTPS' : 'HTTP'}${this.config.enableWebSocket ? '+WS' : ''} on ${location}`);
+            this._onDidChangeStatus.fire();
+        }
+    }
+    async restart() {
+        if (this.disposed) {
+            return;
+        }
+        this.logInfo('Restarting API server to apply configuration changes...');
+        await this.start();
+    }
+    async stop() {
+        if (this.wsServer) {
+            await new Promise(resolve => {
+                for (const client of this.wsServer?.clients ?? []) {
+                    client.close(1001, 'Server shutting down');
+                }
+                this.wsServer?.close(() => resolve());
+            });
+        }
+        if (this.httpServer) {
+            await new Promise((resolve, reject) => {
+                this.httpServer?.close(error => {
+                    if (error) {
+                        reject(error);
+                    }
+                    else {
+                        resolve();
+                    }
+                });
+            });
+        }
+        this.httpServer = undefined;
+        this.wsServer = undefined;
+        this.activeRequests = 0;
+        this.updateStatusBar('stopped');
+        this._onDidChangeStatus.fire();
+    }
+    async dispose() {
+        this.disposed = true;
+        this.isShuttingDown = true;
+        this.logInfo('Shutting down API Gateway...');
+        // Stop stats updater
+        if (this.statsInterval) {
+            clearInterval(this.statsInterval);
+            this.statsInterval = undefined;
+        }
+        // Stop domain cache refresh
+        if (this.domainRefreshInterval) {
+            clearInterval(this.domainRefreshInterval);
+            this.domainRefreshInterval = undefined;
+        }
+        // Save history before disposing
+        this.saveHistory();
+        // Wait a bit for active requests to finish
+        if (this.activeRequests > 0) {
+            this.logInfo(`Waiting for ${this.activeRequests} active requests to complete...`);
+            let waitTime = 0;
+            while (this.activeRequests > 0 && waitTime < 3000) { // Max 3 seconds wait
+                await new Promise(resolve => setTimeout(resolve, 100));
+                waitTime += 100;
+            }
+            if (this.activeRequests > 0) {
+                this.logInfo(`Forcing close of ${this.activeRequests} remaining requests.`);
+            }
+        }
+        // Close all open HTTP connections
+        for (const res of this.connections) {
+            if (!res.writableEnded) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'Server is shutting down', type: 'service_unavailable' } }));
+            }
+        }
+        this.connections.clear();
+        // Stop Cloudflare tunnel if running
+        await this.stopTunnel().catch(error => {
+            this.logError('Failed to stop tunnel during dispose', error);
+        });
+        await this.stop().catch(error => {
+            this.logError('Failed to stop API server during dispose', error);
+        });
+        for (const disposable of this.disposables.splice(0)) {
+            disposable.dispose();
+        }
+        await this.mcpService?.dispose();
+        this._onDidChangeStatus.dispose();
+        this.logInfo('API Gateway shut down successfully.');
+    }
+    async handleHttpRequest(req, res, requestId, requestStart) {
+        if (this.isShuttingDown) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'Server is shutting down', type: 'service_unavailable' } }));
+            return;
+        }
+        this.setCorsHeaders(res);
+        // Add X-Request-ID header for debugging
+        res.setHeader('X-Request-ID', requestId);
+        if (req.method === 'OPTIONS') {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        if (!this.config.enableHttp) {
+            throw new ApiError(503, 'HTTP API is disabled. Enable it from the proxy controls.', 'service_unavailable', 'http_disabled');
+        }
+        const url = this.buildUrl(req.url);
+        // Get client IP for rate limiting
+        const clientIp = this.getClientIp(req);
+        // Per-IP connection limiting
+        const currentConnections = this.activeConnectionsPerIp.get(clientIp) || 0;
+        if (currentConnections >= this.config.maxConnectionsPerIp) {
+            this.logRequest(requestId, req.method || 'UNKNOWN', url.pathname, 429, Date.now() - requestStart, {
+                requestHeaders: req.headers
+            });
+            throw new ApiError(429, `Too many connections from your IP. Maximum ${this.config.maxConnectionsPerIp} concurrent connections allowed.`, 'rate_limit_error', 'too_many_connections');
+        }
+        this.activeConnectionsPerIp.set(clientIp, currentConnections + 1);
+        // Ensure we decrement the counter when the request ends
+        res.on('close', () => {
+            const count = this.activeConnectionsPerIp.get(clientIp) || 1;
+            if (count <= 1) {
+                this.activeConnectionsPerIp.delete(clientIp);
+            }
+            else {
+                this.activeConnectionsPerIp.set(clientIp, count - 1);
+            }
+        });
+        // Authentication check (skip for health endpoint)
+        if (this.config.apiKey && url.pathname !== '/health') {
+            const authHeader = req.headers['authorization'];
+            const xApiKey = req.headers['x-api-key'];
+            // Accept both Bearer token (OpenAI style) and x-api-key (Anthropic/Claude Code style)
+            const providedKey = authHeader?.startsWith('Bearer ')
+                ? authHeader.slice(7)
+                : (typeof xApiKey === 'string' ? xApiKey : null);
+            if (providedKey !== this.config.apiKey) {
+                this.logRequest(requestId, req.method || 'UNKNOWN', url.pathname, 401, Date.now() - requestStart, {
+                    requestHeaders: req.headers
+                });
+                throw new ApiError(401, 'Invalid or missing API key. Provide a valid Bearer token.', 'authentication_error', 'invalid_api_key');
+            }
+        }
+        // Rate limiting check
+        if (!this.checkRateLimit()) {
+            this.logRequest(requestId, req.method || 'UNKNOWN', url.pathname, 429, Date.now() - requestStart, {
+                requestHeaders: req.headers
+            });
+            const oldestRequest = this.rateLimitBucket.length > 0 ? this.rateLimitBucket[0] : Date.now();
+            const waitTime = Math.ceil((oldestRequest + 60000 - Date.now()) / 1000);
+            throw new ApiError(429, `Rate limit exceeded (${this.config.rateLimitPerMinute} requests/min). Please wait ${waitTime > 0 ? waitTime : 1} seconds before retrying.`, 'rate_limit_error', 'rate_limit_exceeded');
+        }
+        // IP Allowlist check
+        if (!this.checkIpAllowlist(req)) {
+            this.logRequest(requestId, req.method || 'UNKNOWN', url.pathname, 403, Date.now() - requestStart, {
+                requestHeaders: req.headers
+            });
+            throw new ApiError(403, 'Access denied. Your IP address is not allowed.', 'access_denied', 'ip_not_allowed');
+        }
+        // Track request
+        this.usageStats.totalRequests++;
+        this.usageStats.requestsByEndpoint[url.pathname] = (this.usageStats.requestsByEndpoint[url.pathname] || 0) + 1;
+        // Enhanced health check - verify Copilot is actually available
+        if (req.method === 'GET' && url.pathname === '/health') {
+            try {
+                const models = await selectChatModelsSafe(this.output);
+                if (models && models.length > 0) {
+                    this.sendJson(res, 200, {
+                        status: 'ok',
+                        service: 'proxy',
+                        copilot: 'available',
+                        models: models.length
+                    });
+                }
+                else {
+                    this.sendJson(res, 200, {
+                        status: 'degraded',
+                        service: 'proxy',
+                        copilot: 'unavailable',
+                        message: 'No language models found. Check if a language model provider (e.g. GitHub Copilot) is installed and signed in.'
+                    });
+                }
+            }
+            catch {
+                this.sendJson(res, 200, {
+                    status: 'degraded',
+                    service: 'proxy',
+                    copilot: 'error',
+                    message: 'Failed to check Copilot availability.'
+                });
+            }
+            return;
+        }
+        // OpenAPI specification
+        if (req.method === 'GET' && url.pathname === '/openapi.json') {
+            this.sendJson(res, 200, this.getOpenApiSpec());
+            return;
+        }
+        // Swagger UI documentation
+        if (req.method === 'GET' && url.pathname === '/docs') {
+            this.sendSwaggerUi(res);
+            return;
+        }
+        // Usage statistics
+        if (req.method === 'GET' && url.pathname === '/v1/usage') {
+            const uptime = Math.floor((Date.now() - this.usageStats.startTime) / 1000);
+            this.sendJson(res, 200, {
+                object: 'usage',
+                total_requests: this.usageStats.totalRequests,
+                total_tokens: {
+                    input: this.usageStats.totalTokensIn,
+                    output: this.usageStats.totalTokensOut,
+                    total: this.usageStats.totalTokensIn + this.usageStats.totalTokensOut
+                },
+                requests_by_endpoint: this.usageStats.requestsByEndpoint,
+                uptime_seconds: uptime,
+                active_requests: this.activeRequests
+            });
+            return;
+        }
+        // List all models
+        if (req.method === 'GET' && url.pathname === '/v1/models') {
+            const models = await this.getAvailableModels();
+            this.sendJson(res, 200, {
+                object: 'list',
+                data: models
+            });
+            return;
+        }
+        // Get specific model
+        const modelMatch = url.pathname.match(/^\/v1\/models\/(.+)$/);
+        if (req.method === 'GET' && modelMatch) {
+            const modelId = decodeURIComponent(modelMatch[1]);
+            const models = await this.getAvailableModels();
+            const model = models.find(m => m.id === modelId);
+            if (!model) {
+                throw new ApiError(404, `Model '${modelId}' not found`, 'not_found', 'model_not_found');
+            }
+            this.sendJson(res, 200, model);
+            return;
+        }
+        // List all available tools (MCP + VS Code built-in)
+        if (req.method === 'GET' && url.pathname === '/v1/tools') {
+            const mcpService = await this.ensureMcpService();
+            const tools = mcpService ? await mcpService.getAllTools() : [];
+            this.sendJson(res, 200, {
+                object: 'list',
+                data: tools.map(t => ({
+                    type: 'function',
+                    server: t.serverName,
+                    function: {
+                        name: t.name,
+                        description: t.description || '',
+                        parameters: t.inputSchema || {}
+                    }
+                }))
+            });
+            return;
+        }
+        // Call a specific tool
+        if (req.method === 'POST' && url.pathname === '/v1/tools/call') {
+            const body = await this.readJsonBody(req);
+            const { server, name, arguments: args } = body || {};
+            if (!server || !name) {
+                throw new ApiError(400, 'server and name are required', 'invalid_request_error', 'missing_params');
+            }
+            const mcpService = await this.ensureMcpService();
+            if (!mcpService) {
+                throw new ApiError(503, 'MCP service not available', 'service_unavailable', 'mcp_unavailable');
+            }
+            const result = await mcpService.callTool(server, name, args || {});
+            this.sendJson(res, 200, {
+                object: 'tool_result',
+                server,
+                name,
+                result
+            });
+            return;
+        }
+        // List connected MCP servers
+        if (req.method === 'GET' && url.pathname === '/v1/mcp/servers') {
+            const mcpService = await this.ensureMcpService();
+            const servers = mcpService ? mcpService.getConnectedServers() : [];
+            const tools = mcpService ? await mcpService.getAllTools() : [];
+            // Group tools by server
+            const serverDetails = servers.map(name => ({
+                name,
+                status: 'connected',
+                tools: tools.filter(t => t.serverName === name).map(t => t.name)
+            }));
+            // Add VS Code built-in tools
+            const vscodeTools = tools.filter(t => t.serverName === 'vscode');
+            if (vscodeTools.length > 0) {
+                serverDetails.push({
+                    name: 'vscode',
+                    status: 'built-in',
+                    tools: vscodeTools.map(t => t.name)
+                });
+            }
+            this.sendJson(res, 200, {
+                object: 'list',
+                data: serverDetails
+            });
+            return;
+        }
+        // Refresh MCP servers (reconnect)
+        if (req.method === 'POST' && url.pathname === '/v1/mcp/servers/refresh') {
+            const mcpService = await this.ensureMcpService();
+            if (mcpService) {
+                await mcpService.refreshServers();
+            }
+            const servers = mcpService ? mcpService.getConnectedServers() : [];
+            this.sendJson(res, 200, {
+                object: 'refresh_result',
+                message: 'MCP servers refreshed',
+                connected: servers
+            });
+            return;
+        }
+        if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+            const body = await this.readJsonBody(req);
+            // Normalize max_completion_tokens → max_tokens (OpenAI GPT-5.x deprecation)
+            if (body?.max_completion_tokens && !body?.max_tokens) {
+                body.max_tokens = body.max_completion_tokens;
+            }
+            // Normalize reasoning_effort → top-level for o-series models (Dec 2024)
+            // Preserve it in the payload so processChatCompletion can forward it
+            if (body?.reasoning_effort && !body?.reasoning) {
+                body.reasoning = { effort: body.reasoning_effort };
+            }
+            // Normalize 'developer' role → 'system' (OpenAI 2025+ change)
+            if (body?.messages && Array.isArray(body.messages)) {
+                for (const msg of body.messages) {
+                    if (msg.role === 'developer') {
+                        msg.role = 'system';
+                    }
+                }
+            }
+            if (body?.stream === true) {
+                await this.processStreamingChatCompletion(body, req, res, requestId, requestStart);
+            }
+            else {
+                const response = await this.processChatCompletion(body, { source: 'http', endpoint: '/v1/chat/completions' });
+                this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                    requestPayload: body,
+                    responsePayload: response,
+                    tokensIn: response?.usage?.prompt_tokens,
+                    tokensOut: response?.usage?.completion_tokens,
+                    model: body?.model,
+                    requestHeaders: req.headers,
+                    responseHeaders: res.getHeaders()
+                });
+                this.sendJson(res, 200, response);
+            }
+            return;
+        }
+        // Anthropic Messages API
+        if (req.method === 'POST' && url.pathname === '/v1/messages') {
+            const body = await this.readJsonBody(req);
+            // Model validation
+            if (body?.model && !this.resolveModel(body.model)) {
+                throw new ApiError(400, `Model '${body.model}' is not supported.`, 'invalid_request_error', 'model_not_found');
+            }
+            if (body?.stream === true) {
+                await this.processStreamingAnthropicMessages(body, req, res, requestId, requestStart);
+            }
+            else {
+                try {
+                    const response = await this.processAnthropicMessages(body);
+                    this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                        requestPayload: body,
+                        responsePayload: response,
+                        tokensIn: response?.usage?.input_tokens,
+                        tokensOut: response?.usage?.output_tokens,
+                        model: body?.model,
+                        requestHeaders: req.headers,
+                        responseHeaders: res.getHeaders()
+                    });
+                    this.sendJson(res, 200, response);
+                }
+                catch (error) {
+                    const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'api_error');
+                    this.sendJson(res, apiError.status, {
+                        type: 'error',
+                        error: {
+                            type: apiError.code || 'api_error',
+                            message: apiError.message
+                        }
+                    });
+                }
+            }
+            return;
+        }
+        // Text completions (with streaming support)
+        if (req.method === 'POST' && url.pathname === '/v1/completions') {
+            const body = await this.readJsonBody(req);
+            if (body?.stream === true) {
+                await this.processStreamingCompletion(body, req, res, requestId, requestStart);
+            }
+            else {
+                const response = await this.processCompletion(body);
+                this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                    requestPayload: body,
+                    responsePayload: response,
+                    tokensIn: response?.usage?.prompt_tokens,
+                    tokensOut: response?.usage?.completion_tokens,
+                    model: body?.model,
+                    requestHeaders: req.headers,
+                    responseHeaders: res.getHeaders()
+                });
+                this.sendJson(res, 200, response);
+            }
+            return;
+        }
+        // Token counting
+        if (req.method === 'POST' && url.pathname === '/v1/tokenize') {
+            const body = await this.readJsonBody(req);
+            const response = await this.processTokenize(body);
+            this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                requestPayload: body,
+                responsePayload: response,
+                model: body?.model,
+                requestHeaders: req.headers,
+                responseHeaders: res.getHeaders()
+            });
+            this.sendJson(res, 200, response);
+            return;
+        }
+        // Count tokens (alternative endpoint)
+        if (req.method === 'POST' && url.pathname === '/v1/count_tokens') {
+            const body = await this.readJsonBody(req);
+            const response = await this.processTokenize(body);
+            this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                requestPayload: body,
+                responsePayload: response,
+                model: body?.model,
+                requestHeaders: req.headers,
+                responseHeaders: res.getHeaders()
+            });
+            this.sendJson(res, 200, response);
+            return;
+        }
+        // Responses API (OpenAI 2026 spec)
+        if (req.method === 'POST' && url.pathname === '/v1/responses') {
+            const body = await this.readJsonBody(req);
+            if (body?.stream === true) {
+                await this.processStreamingResponsesApi(body, req, res, requestId, requestStart);
+            }
+            else {
+                const response = await this.processResponsesApi(body);
+                this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                    requestPayload: body,
+                    responsePayload: response,
+                    tokensIn: response?.usage?.input_tokens,
+                    tokensOut: response?.usage?.output_tokens,
+                    model: body?.model,
+                    requestHeaders: req.headers,
+                    responseHeaders: res.getHeaders()
+                });
+                this.sendJson(res, 200, response);
+            }
+            return;
+        }
+        // Google Generative AI API
+        const googleMatch = url.pathname.match(/^\/v1beta\/models\/(.+):generateContent$/);
+        const googleStreamMatch = url.pathname.match(/^\/v1beta\/models\/(.+):streamGenerateContent$/);
+        if (req.method === 'POST' && (googleMatch || googleStreamMatch)) {
+            const modelId = decodeURIComponent((googleMatch || googleStreamMatch)[1]);
+            const body = await this.readJsonBody(req);
+            // Model validation
+            if (modelId && !this.resolveModel(modelId)) {
+                throw new ApiError(400, `Model '${modelId}' is not supported.`, 'invalid_request_error', 'model_not_found');
+            }
+            if (googleStreamMatch) {
+                await this.processStreamingGoogleGenerateContent(modelId, body, req, res, requestId, requestStart);
+            }
+            else {
+                try {
+                    const response = await this.processGoogleGenerateContent(modelId, body);
+                    this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                        requestPayload: body,
+                        responsePayload: response,
+                        tokensIn: response?.usageMetadata?.promptTokenCount,
+                        tokensOut: response?.usageMetadata?.candidatesTokenCount,
+                        model: modelId,
+                        requestHeaders: req.headers,
+                        responseHeaders: res.getHeaders()
+                    });
+                    this.sendJson(res, 200, response);
+                }
+                catch (error) {
+                    const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'server_error');
+                    this.sendJson(res, apiError.status, {
+                        error: {
+                            code: apiError.status,
+                            message: apiError.message,
+                            status: apiError.code || 'INTERNAL'
+                        }
+                    });
+                }
+            }
+            return;
+        }
+        // Llama API (OpenAI-compatible format with Llama branding)
+        // Since Llama uses OpenAI-compatible format, we reuse processChatCompletion
+        if (req.method === 'POST' && url.pathname === '/llama/v1/chat/completions') {
+            const body = await this.readJsonBody(req);
+            // Handle max_completion_tokens (Llama) as max_tokens (OpenAI)
+            if (body?.max_completion_tokens && !body?.max_tokens) {
+                body.max_tokens = body.max_completion_tokens;
+            }
+            // Normalize reasoning_effort → top-level for o-series models (Dec 2024)
+            if (body?.reasoning_effort && !body?.reasoning) {
+                body.reasoning = { effort: body.reasoning_effort };
+            }
+            // Normalize 'developer' role → 'system' (OpenAI 2025+ change)
+            if (body?.messages && Array.isArray(body.messages)) {
+                for (const msg of body.messages) {
+                    if (msg.role === 'developer') {
+                        msg.role = 'system';
+                    }
+                }
+            }
+            if (body?.stream === true) {
+                await this.processStreamingChatCompletion(body, req, res, requestId, requestStart);
+            }
+            else {
+                const response = await this.processChatCompletion(body, { source: 'http', endpoint: '/llama/v1/chat/completions' });
+                this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+                    requestPayload: body,
+                    responsePayload: response,
+                    tokensIn: response?.usage?.prompt_tokens,
+                    tokensOut: response?.usage?.completion_tokens,
+                    model: body?.model,
+                    requestHeaders: req.headers,
+                    responseHeaders: res.getHeaders()
+                });
+                this.sendJson(res, 200, response);
+            }
+            return;
+        }
+        // Embeddings (not supported)
+        if (req.method === 'POST' && url.pathname === '/v1/embeddings') {
+            throw new ApiError(501, 'Embeddings are not supported by Copilot.', 'not_implemented', 'embeddings_not_supported');
+        }
+        // Images (not supported)
+        if (url.pathname.startsWith('/v1/images')) {
+            throw new ApiError(501, 'Image generation is not supported by Copilot.', 'not_implemented', 'images_not_supported');
+        }
+        // Audio (not supported)
+        if (url.pathname.startsWith('/v1/audio')) {
+            throw new ApiError(501, 'Audio processing is not supported by Copilot.', 'not_implemented', 'audio_not_supported');
+        }
+        // WebSocket explicit 426 Upgrade Required for HTTP requests
+        const wsEndpoints = ['/v1/realtime', '/anthropic/v1/realtime', '/google/v1/realtime', '/llama/v1/realtime'];
+        if (req.method === 'GET' && wsEndpoints.includes(url.pathname)) {
+            res.writeHead(426, { 'Content-Type': 'application/json', 'Upgrade': 'websocket' });
+            res.end(JSON.stringify({
+                error: {
+                    message: 'This is a WebSocket endpoint. Please use a WebSocket client and Upgrade header.',
+                    type: 'upgrade_required',
+                    code: 'websocket_only'
+                }
+            }));
+            return;
+        }
+        throw new ApiError(404, `No route for ${req.method ?? 'UNKNOWN'} ${url.pathname}`, 'not_found');
+    }
+    async processStreamingGoogleGenerateContent(modelId, payload, req, res, logRequestId, logRequestStart) {
+        const messages = [];
+        if (payload.systemInstruction) {
+            const systemText = payload.systemInstruction.parts.map(p => p.text).join(' ');
+            messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(systemText)));
+        }
+        for (const content of payload.contents) {
+            const role = content.role === 'model' ? vscode.LanguageModelChatMessageRole.Assistant : vscode.LanguageModelChatMessageRole.User;
+            const text = content.parts.map(p => p.text).join(' ');
+            const redactedText = this.redactPromptString(text);
+            if (role === vscode.LanguageModelChatMessageRole.User) {
+                messages.push(vscode.LanguageModelChatMessage.User(redactedText));
+            }
+            else {
+                messages.push(vscode.LanguageModelChatMessage.Assistant(redactedText));
+            }
+        }
+        const resolvedModel = this.resolveModel(modelId);
+        const promptStr = messages.map(m => {
+            if (typeof m.content === 'string') {
+                return m.content;
+            }
+            return m.content.map(p => {
+                if ('text' in p) {
+                    return p.text;
+                }
+                return '';
+            }).join(' ');
+        }).join('\n');
+        // Set headers - Google stream is a JSON array of response objects, usually
+        // but since we want to mimic their SDK behavior, we might use EventStream or just chunked JSON
+        // Google's streamGenerateContent typically returns a JSON array over time
+        res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'X-HTTP-Content-Type-Options': 'nosniff',
+            'Transfer-Encoding': 'chunked'
+        });
+        let totalContent = '';
+        const cts = new vscode.CancellationTokenSource();
+        req.on('close', () => {
+            cts.cancel();
+            console.log(`[Google] Client disconnected, cancelling request ${logRequestId || ''}`);
+        });
+        try {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            const lmModel = this.findModel(resolvedModel, copilotModels);
+            if (!lmModel) {
+                throw new ApiError(404, `Model "${resolvedModel}" not found. Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
+            }
+            const response = await lmModel.sendRequest(messages, {}, cts.token);
+            // Google's format is an array of objects
+            res.write('[\n');
+            let firstPart = true;
+            for await (const part of response.stream) {
+                if (cts.token.isCancellationRequested) {
+                    break;
+                }
+                let textValue;
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    textValue = part.value;
+                }
+                else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
+                    textValue = this.extractTextFromPart(part);
+                }
+                if (textValue) {
+                    totalContent += textValue;
+                    if (!firstPart) {
+                        res.write(',\n');
+                    }
+                    const chunk = {
+                        candidates: [{
+                                content: {
+                                    role: 'model',
+                                    parts: [{ text: textValue }]
+                                },
+                                finishReason: 'STOP',
+                                index: 0
+                            }],
+                        usageMetadata: {
+                            promptTokenCount: 0,
+                            candidatesTokenCount: 0,
+                            totalTokenCount: 0
+                        }
+                    };
+                    res.write(JSON.stringify(chunk));
+                    firstPart = false;
+                }
+            }
+            if (!cts.token.isCancellationRequested) {
+                res.write('\n]\n');
+                res.end();
+            }
+            // Token counting (best effort for logs)
+            let inputTokens = 0;
+            let outputTokens = 0;
+            try {
+                inputTokens = await lmModel.countTokens(promptStr, cts.token);
+                outputTokens = await lmModel.countTokens(totalContent, cts.token);
+            }
+            catch (e) { }
+            if (logRequestId) {
+                this.logRequest(logRequestId, 'POST', `/v1beta/models/${modelId}:streamGenerateContent`, 200, Date.now() - (logRequestStart || 0), {
+                    requestPayload: payload,
+                    responsePayload: { candidates: [{ content: { parts: [{ text: totalContent }] } }] },
+                    tokensIn: inputTokens,
+                    tokensOut: outputTokens,
+                    model: resolvedModel
+                });
+            }
+        }
+        catch (error) {
+            if (cts.token.isCancellationRequested) {
+                return;
+            }
+            console.error('Google streaming error:', error);
+            const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'server_error');
+            res.write(JSON.stringify({ error: { code: apiError.status, message: apiError.message, status: apiError.code } }));
+            res.end();
+        }
+        finally {
+            cts.dispose();
+        }
+    }
+    async processStreamingAnthropicMessages(payload, req, res, logRequestId, logRequestStart) {
+        const messages = [];
+        const systemText = typeof payload.system === 'string'
+            ? payload.system
+            : Array.isArray(payload.system)
+                ? payload.system.map((b) => b.text || '').join('\n')
+                : '';
+        if (systemText) {
+            messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(systemText)));
+        }
+        for (const msg of payload.messages) {
+            const role = msg.role === 'user' ? vscode.LanguageModelChatMessageRole.User : vscode.LanguageModelChatMessageRole.Assistant;
+            const content = this.flattenMessageContent(msg.content);
+            const redactedContent = this.redactPromptString(content);
+            if (role === vscode.LanguageModelChatMessageRole.User) {
+                messages.push(vscode.LanguageModelChatMessage.User(redactedContent));
+            }
+            else {
+                messages.push(vscode.LanguageModelChatMessage.Assistant(redactedContent));
+            }
+        }
+        const resolvedModel = this.resolveModel(payload.model);
+        const promptStr = messages.map(m => {
+            if (typeof m.content === 'string') {
+                return m.content;
+            }
+            return m.content.map(p => {
+                if ('text' in p) {
+                    return p.text;
+                }
+                return '';
+            }).join(' ');
+        }).join('\n');
+        // Set SSE headers
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        });
+        const messageId = 'ant-' + randomUUID();
+        let totalContent = '';
+        const cts = new vscode.CancellationTokenSource();
+        req.on('close', () => {
+            cts.cancel();
+            console.log(`[Anthropic] Client disconnected, cancelling request ${logRequestId || ''}`);
+        });
+        // Heartbeat to keep connection alive
+        const heartbeat = setInterval(() => {
+            if (!res.writableEnded) {
+                res.write(': ping\n\n');
+            }
+        }, 15000);
+        try {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            const lmModel = this.findModel(resolvedModel, copilotModels);
+            if (!lmModel) {
+                throw new ApiError(404, `Model "${resolvedModel}" not found. Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
+            }
+            // Build request options — pass tools if provided (Anthropic → VS Code LM format)
+            const streamOptions = {};
+            if (payload.tools && payload.tools.length > 0) {
+                streamOptions.tools = payload.tools.map(t => ({
+                    name: t.name,
+                    description: t.description || '',
+                    inputSchema: t.input_schema
+                }));
+                const tc = payload.tool_choice;
+                const tcType = typeof tc === 'string' ? tc : tc?.type;
+                streamOptions.toolMode = (tcType === 'any' || tcType === 'tool')
+                    ? vscode.LanguageModelChatToolMode.Required
+                    : vscode.LanguageModelChatToolMode.Auto;
+            }
+            const response = await lmModel.sendRequest(messages, streamOptions, cts.token);
+            // Anthropic streaming starts with message_start
+            res.write(`event: message_start\ndata: ${JSON.stringify({
+                type: 'message_start',
+                message: {
+                    id: messageId,
+                    type: 'message',
+                    role: 'assistant',
+                    content: [],
+                    model: resolvedModel,
+                    stop_reason: null,
+                    stop_sequence: null,
+                    usage: { input_tokens: 0, output_tokens: 0 }
+                }
+            })}\n\n`);
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                type: 'content_block_start',
+                index: 0,
+                content_block: { type: 'text', text: '' }
+            })}\n\n`);
+            let contentBlockIndex = 0;
+            let hasToolCalls = false;
+            for await (const part of response.stream) {
+                if (cts.token.isCancellationRequested) {
+                    break;
+                }
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    totalContent += part.value;
+                    res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                        type: 'content_block_delta',
+                        index: contentBlockIndex,
+                        delta: { type: 'text_delta', text: part.value }
+                    })}\n\n`);
+                }
+                else if (part instanceof vscode.LanguageModelToolCallPart) {
+                    // Close the current text block first (if any)
+                    if (!hasToolCalls) {
+                        res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: contentBlockIndex })}\n\n`);
+                        hasToolCalls = true;
+                    }
+                    contentBlockIndex++;
+                    const toolCallId = `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+                    const argsStr = typeof part.input === 'string' ? part.input : JSON.stringify(part.input);
+                    res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                        type: 'content_block_start',
+                        index: contentBlockIndex,
+                        content_block: { type: 'tool_use', id: toolCallId, name: part.name, input: {} }
+                    })}\n\n`);
+                    res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                        type: 'content_block_delta',
+                        index: contentBlockIndex,
+                        delta: { type: 'input_json_delta', partial_json: argsStr }
+                    })}\n\n`);
+                    res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: contentBlockIndex })}\n\n`);
+                }
+                else {
+                    // Handle unknown part types (e.g. LanguageModelThinkingPart from reasoning models)
+                    const textValue = this.extractTextFromPart(part);
+                    if (textValue) {
+                        totalContent += textValue;
+                        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                            type: 'content_block_delta',
+                            index: contentBlockIndex,
+                            delta: { type: 'text_delta', text: textValue }
+                        })}\n\n`);
+                    }
+                }
+            }
+            if (!cts.token.isCancellationRequested) {
+                // Close the last text block if there were no tool calls
+                if (!hasToolCalls) {
+                    res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                        type: 'content_block_stop',
+                        index: 0
+                    })}\n\n`);
+                }
+                res.write(`event: message_delta\ndata: ${JSON.stringify({
+                    type: 'message_delta',
+                    delta: { stop_reason: hasToolCalls ? 'tool_use' : 'end_turn', stop_sequence: null },
+                    usage: { output_tokens: 0 }
+                })}\n\n`);
+                res.write(`event: message_stop\ndata: ${JSON.stringify({
+                    type: 'message_stop'
+                })}\n\n`);
+                res.end();
+            }
+            // Token counting (best effort for logs)
+            let inputTokens = 0;
+            let outputTokens = 0;
+            try {
+                inputTokens = await lmModel.countTokens(promptStr, cts.token);
+                outputTokens = await lmModel.countTokens(totalContent, cts.token);
+            }
+            catch (e) { }
+            if (logRequestId) {
+                this.logRequest(logRequestId, 'POST', '/v1/messages', 200, Date.now() - (logRequestStart || 0), {
+                    requestPayload: payload,
+                    responsePayload: { id: messageId, type: 'message', content: [{ type: 'text', text: totalContent }] },
+                    tokensIn: inputTokens,
+                    tokensOut: outputTokens,
+                    model: resolvedModel
+                });
+            }
+        }
+        catch (error) {
+            if (cts.token.isCancellationRequested) {
+                return;
+            }
+            console.error('Anthropic streaming error:', error);
+            const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'server_error');
+            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: apiError.code || 'api_error', message: apiError.message } })}\n\n`);
+            res.end();
+        }
+        finally {
+            clearInterval(heartbeat);
+            cts.dispose();
+        }
+    }
+    async getAvailableModels() {
+        const now = Math.floor(Date.now() / 1000);
+        // Fetch ALL language models registered in VS Code, not just Copilot
+        const allModels = await selectChatModelsSafe(this.output);
+        const modelData = allModels.map(model => ({
+            id: model.id,
+            object: 'model',
+            created: now,
+            owned_by: model.vendor || 'unknown',
+            name: model.name,
+            family: model.family,
+            version: model.version,
+            max_input_tokens: model.maxInputTokens,
+            capabilities: {
+                chat_completion: true,
+                text_completion: true,
+                streaming: true,
+                token_counting: true
+            }
+        }));
+        const customModels = (await this.getCustomProviderModels()).map(model => ({
+            id: model.id,
+            object: 'model',
+            created: now,
+            owned_by: model.provider.name,
+            name: model.rawModelId,
+            family: model.rawModelId,
+            version: 'custom-provider',
+            endpoint: model.provider.baseUrl,
+            capabilities: {
+                chat_completion: true,
+                text_completion: true,
+                streaming: true
+            }
+        }));
+        return [...modelData, ...customModels];
+    }
+    async processStreamingChatCompletion(payload, req, res, logRequestId, logRequestStart) {
+        let messages = this.normalizeChatMessages(payload);
+        // Inject default system prompt if needed
+        messages = this.injectSystemPrompt(messages);
+        // Apply redaction to OUTBOUND messages before sending to Copilot
+        messages = this.redactMessagesContent(messages);
+        const model = this.resolveModel(payload?.model);
+        const customProviderModel = await this.findCustomProviderModel(model);
+        if (customProviderModel) {
+            await this.proxyStreamingChatCompletion(customProviderModel, payload, res);
+            return;
+        }
+        const tools = this.normalizeTools(payload?.tools || payload?.functions);
+        const toolChoice = payload?.tool_choice || payload?.function_call;
+        const requestId = `chatcmpl-${randomUUID()}`;
+        const created = Math.floor(Date.now() / 1000);
+        let totalContent = '';
+        // Set SSE headers
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        });
+        try {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            const lmModel = this.findModel(model, copilotModels);
+            if (!lmModel) {
+                throw new ApiError(404, `Model "${model}" not found. Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
+            }
+            // Convert messages to VS Code format
+            const lmMessages = [];
+            for (const msg of messages) {
+                const content = this.flattenMessageContent(msg.content);
+                switch (msg.role) {
+                    case 'system':
+                        lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${content}`));
+                        break;
+                    case 'user':
+                        lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+                        break;
+                    case 'assistant':
+                        if (msg.tool_calls && msg.tool_calls.length > 0) {
+                            const toolCallInfo = msg.tool_calls.map((tc) => `[Called function: ${tc.function?.name || tc.name}(${tc.function?.arguments || JSON.stringify(tc.arguments)})]`).join('\n');
+                            lmMessages.push(vscode.LanguageModelChatMessage.Assistant(toolCallInfo));
+                        }
+                        else {
+                            lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
+                        }
+                        break;
+                    case 'tool':
+                        const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content}`;
+                        lmMessages.push(vscode.LanguageModelChatMessage.User(toolResultContent));
+                        break;
+                    default:
+                        lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+                }
+            }
+            // Build request options with tools
+            const options = {};
+            if (tools && tools.length > 0) {
+                options.tools = tools;
+                if (toolChoice === 'required' || toolChoice === 'any') {
+                    options.toolMode = vscode.LanguageModelChatToolMode.Required;
+                }
+                else {
+                    options.toolMode = vscode.LanguageModelChatToolMode.Auto;
+                }
+            }
+            const response = await lmModel.sendRequest(lmMessages, options, new vscode.CancellationTokenSource().token);
+            // Track tool calls during streaming
+            const toolCalls = [];
+            let toolCallIndex = 0;
+            // Stream using the response.stream to handle both text and tool calls
+            for await (const part of response.stream) {
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    totalContent += part.value;
+                    const chunk = {
+                        id: requestId,
+                        object: 'chat.completion.chunk',
+                        created,
+                        model,
+                        choices: [{
+                                index: 0,
+                                delta: { content: part.value },
+                                finish_reason: null
+                            }]
+                    };
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                }
+                else if (part instanceof vscode.LanguageModelToolCallPart) {
+                    // Stream tool call in OpenAI format
+                    const toolCallId = `call_${randomUUID().slice(0, 24)}`;
+                    const args = typeof part.input === 'string' ? part.input : JSON.stringify(part.input);
+                    toolCalls.push({
+                        id: toolCallId,
+                        name: part.name,
+                        arguments: args
+                    });
+                    // Send tool call chunk
+                    const toolCallChunk = {
+                        id: requestId,
+                        object: 'chat.completion.chunk',
+                        created,
+                        model,
+                        choices: [{
+                                index: 0,
+                                delta: {
+                                    tool_calls: [{
+                                            index: toolCallIndex,
+                                            id: toolCallId,
+                                            type: 'function',
+                                            function: {
+                                                name: part.name,
+                                                arguments: args
+                                            }
+                                        }]
+                                },
+                                finish_reason: null
+                            }]
+                    };
+                    res.write(`data: ${JSON.stringify(toolCallChunk)}\n\n`);
+                    toolCallIndex++;
+                }
+                else {
+                    // Handle unknown part types (e.g. LanguageModelThinkingPart from reasoning models)
+                    const textValue = this.extractTextFromPart(part);
+                    if (textValue) {
+                        totalContent += textValue;
+                        const chunk = {
+                            id: requestId,
+                            object: 'chat.completion.chunk',
+                            created,
+                            model,
+                            choices: [{
+                                    index: 0,
+                                    delta: { content: textValue },
+                                    finish_reason: null
+                                }]
+                        };
+                        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                    }
+                }
+            }
+            // Send final chunk with appropriate finish_reason
+            const finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop';
+            const finalChunk = {
+                id: requestId,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{
+                        index: 0,
+                        delta: {},
+                        finish_reason: finishReason
+                    }]
+            };
+            res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+            // Emit usage chunk if stream_options.include_usage is requested
+            if (payload?.stream_options?.include_usage) {
+                let tokensIn = 0;
+                let tokensOut = 0;
+                try {
+                    const inputString = lmMessages.map(m => {
+                        // @ts-ignore
+                        return typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+                    }).join('\n');
+                    tokensIn = await lmModel.countTokens(inputString, new vscode.CancellationTokenSource().token);
+                    tokensOut = await lmModel.countTokens(totalContent, new vscode.CancellationTokenSource().token);
+                }
+                catch (_) { /* best effort */ }
+                const usageChunk = {
+                    id: requestId,
+                    object: 'chat.completion.chunk',
+                    created,
+                    model,
+                    choices: [],
+                    usage: {
+                        prompt_tokens: tokensIn,
+                        completion_tokens: tokensOut,
+                        total_tokens: tokensIn + tokensOut
+                    }
+                };
+                res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+            }
+            res.write('data: [DONE]\n\n');
+            res.end();
+            // Calculate tokens manually since streaming responses often don't include usage
+            let tokensIn = 0;
+            let tokensOut = 0;
+            try {
+                const inputString = lmMessages.map(m => {
+                    // @ts-ignore - Check for content property structure
+                    return typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+                }).join('\n');
+                tokensIn = await lmModel.countTokens(inputString, new vscode.CancellationTokenSource().token);
+                tokensOut = await lmModel.countTokens(totalContent, new vscode.CancellationTokenSource().token);
+            }
+            catch (e) {
+                // Ignore token counting errors
+                console.error('Failed to count tokens:', e);
+            }
+            // Log the streaming request
+            if (logRequestId && logRequestStart) {
+                this.logRequest(logRequestId, 'POST', '/v1/chat/completions', 200, Date.now() - logRequestStart, {
+                    requestPayload: payload,
+                    responsePayload: { streamed: true, content_preview: totalContent.slice(0, 500), tool_calls: toolCalls },
+                    model: payload?.model,
+                    requestHeaders: req.headers,
+                    responseHeaders: res.getHeaders(),
+                    tokensIn,
+                    tokensOut
+                });
+            }
+        }
+        catch (error) {
+            const errorChunk = {
+                error: {
+                    message: error instanceof Error ? error.message : 'Unknown error',
+                    type: 'server_error'
+                }
+            };
+            res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+            res.end();
+            // Log error for streaming request
+            if (logRequestId && logRequestStart) {
+                this.logRequest(logRequestId, 'POST', '/v1/chat/completions', 500, Date.now() - logRequestStart, {
+                    requestPayload: payload,
+                    error: error instanceof Error ? error.message : String(error),
+                    model: payload?.model,
+                    requestHeaders: req.headers
+                });
+            }
+        }
+    }
+    async processTokenize(payload) {
+        const text = payload?.text || payload?.input || '';
+        const model = this.resolveModel(payload?.model);
+        const copilotModels = await selectChatModelsSafe(this.output);
+        if (!copilotModels || copilotModels.length === 0) {
+            throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+        }
+        const lmModel = this.findModel(model, copilotModels) || copilotModels[0];
+        const tokenCount = await lmModel.countTokens(text);
+        return {
+            object: 'token_count',
+            model,
+            token_count: tokenCount,
+            text_length: text.length
+        };
+    }
+    async processResponsesApi(payload) {
+        // OpenAI Responses API format (2026 spec) - convert to chat completion
+        const input = payload?.input;
+        let messages = [];
+        // Handle 'instructions' as system message (new in 2026 spec)
+        if (payload.instructions) {
+            messages.push({ role: 'system', content: payload.instructions });
+        }
+        // Parse input
+        if (typeof input === 'string') {
+            messages.push({ role: 'user', content: input });
+        }
+        else if (Array.isArray(input)) {
+            for (const item of input) {
+                if (typeof item === 'string') {
+                    messages.push({ role: 'user', content: item });
+                }
+                else if (item.type === 'message' || !item.type) {
+                    // Handle message-type input items
+                    messages.push({
+                        role: item.role || 'user',
+                        content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
+                    });
+                }
+                // Skip other types like 'item_reference' for now
+            }
+        }
+        // Inject default system prompt (if not already set via instructions)
+        if (!payload.instructions) {
+            messages = this.injectSystemPrompt(messages);
+        }
+        // Build VS Code LM messages
+        const lmMessages = [];
+        for (const msg of messages) {
+            const content = this.redactPromptString(String(msg.content));
+            if (msg.role === 'system' || msg.role === 'user') {
+                lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+            }
+            else if (msg.role === 'assistant') {
+                lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
+            }
+        }
+        const model = this.resolveModel(payload?.model);
+        const customProviderModel = await this.findCustomProviderModel(model);
+        if (customProviderModel) {
+            return this.processCustomProviderResponsesApi(customProviderModel, model, payload);
+        }
+        // Validate model exists
+        const copilotModels = await selectChatModelsSafe(this.output);
+        if (!copilotModels || copilotModels.length === 0) {
+            throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+        }
+        const selectedModel = this.findModel(model, copilotModels);
+        if (!selectedModel) {
+            throw new ApiError(404, `Model "${model}" not found. Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
+        }
+        // Build model options (new in 2026 spec support)
+        const modelOptions = {};
+        // Note: VS Code LM API doesn't expose temperature/top_p directly,
+        // but we prepare the structure for future compatibility
+        // Invoke Copilot
+        const text = await this.runWithConcurrency(async () => {
+            const response = await selectedModel.sendRequest(lmMessages, modelOptions, new vscode.CancellationTokenSource().token);
+            let result = '';
+            for await (const part of response.stream) {
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    result += part.value;
+                }
+                else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
+                    const textValue = this.extractTextFromPart(part);
+                    if (textValue) {
+                        result += textValue;
+                    }
+                }
+            }
+            return result;
+        });
+        // Count tokens
+        let inputTokens = 0;
+        let outputTokens = 0;
+        try {
+            const promptStr = messages.map(m => String(m.content)).join('\n');
+            inputTokens = await selectedModel.countTokens(promptStr);
+            outputTokens = await selectedModel.countTokens(text || '');
+        }
+        catch (e) {
+            console.error('Token counting failed:', e);
+        }
+        const createdAt = Math.floor(Date.now() / 1000);
+        return {
+            id: `resp-${randomUUID()}`,
+            object: 'response',
+            created_at: createdAt,
+            completed_at: createdAt,
+            model,
+            status: 'completed',
+            error: null,
+            incomplete_details: null,
+            instructions: payload.instructions ?? null,
+            max_output_tokens: payload.max_output_tokens ?? null,
+            output: [
+                {
+                    type: 'message',
+                    id: `msg-${randomUUID()}`,
+                    status: 'completed',
+                    role: 'assistant',
+                    content: [
+                        {
+                            type: 'output_text',
+                            text: text || '',
+                            annotations: []
+                        }
+                    ]
+                }
+            ],
+            parallel_tool_calls: true,
+            previous_response_id: payload.previous_response_id ?? null,
+            reasoning: {
+                effort: payload.reasoning?.effort ?? null,
+                summary: null
+            },
+            store: payload.store ?? true,
+            temperature: payload.temperature ?? 1.0,
+            text: {
+                format: payload.text?.format ?? {
+                    type: 'text'
+                }
+            },
+            tool_choice: payload.tool_choice ?? 'auto',
+            tools: payload.tools ?? [],
+            top_p: payload.top_p ?? 1.0,
+            truncation: payload.truncation ?? 'disabled',
+            usage: {
+                input_tokens: inputTokens,
+                input_tokens_details: {
+                    cached_tokens: 0
+                },
+                output_tokens: outputTokens,
+                output_tokens_details: {
+                    reasoning_tokens: 0
+                },
+                total_tokens: inputTokens + outputTokens
+            },
+            user: null,
+            metadata: payload.metadata ?? {}
+        };
+    }
+    async processStreamingResponsesApi(payload, req, res, logRequestId, logRequestStart) {
+        // OpenAI Responses API streaming format (2026 spec)
+        const input = payload?.input;
+        let messages = [];
+        // Handle 'instructions' as system message
+        if (payload.instructions) {
+            messages.push({ role: 'system', content: payload.instructions });
+        }
+        // Parse input
+        if (typeof input === 'string') {
+            messages.push({ role: 'user', content: input });
+        }
+        else if (Array.isArray(input)) {
+            for (const item of input) {
+                if (typeof item === 'string') {
+                    messages.push({ role: 'user', content: item });
+                }
+                else if (item.type === 'message' || !item.type) {
+                    messages.push({
+                        role: item.role || 'user',
+                        content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
+                    });
+                }
+            }
+        }
+        // Inject default system prompt if needed
+        if (!payload.instructions) {
+            messages = this.injectSystemPrompt(messages);
+        }
+        // Build VS Code LM messages
+        const lmMessages = [];
+        for (const msg of messages) {
+            const content = this.redactPromptString(String(msg.content));
+            if (msg.role === 'system' || msg.role === 'user') {
+                lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+            }
+            else if (msg.role === 'assistant') {
+                lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
+            }
+        }
+        const model = this.resolveModel(payload?.model);
+        const customProviderModel = await this.findCustomProviderModel(model);
+        if (customProviderModel) {
+            await this.processStreamingCustomProviderResponsesApi(customProviderModel, model, payload, req, res, logRequestId, logRequestStart);
+            return;
+        }
+        const responseId = `resp-${randomUUID()}`;
+        const messageId = `msg-${randomUUID()}`;
+        // Set SSE headers
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        });
+        const cts = new vscode.CancellationTokenSource();
+        req.on('close', () => {
+            cts.cancel();
+            console.log(`[Responses] Client disconnected, cancelling request ${logRequestId || ''}`);
+        });
+        // Heartbeat to keep connection alive
+        const heartbeat = setInterval(() => {
+            if (!res.writableEnded) {
+                res.write(': ping\n\n');
+            }
+        }, 15000);
+        let totalContent = '';
+        try {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            const selectedModel = this.findModel(model, copilotModels);
+            if (!selectedModel) {
+                throw new ApiError(404, `Model "${model}" not found.`, 'invalid_request_error', 'model_not_found');
+            }
+            const lmResponse = await selectedModel.sendRequest(lmMessages, {}, cts.token);
+            // Store createdAt timestamp for consistency
+            const createdAt = Math.floor(Date.now() / 1000);
+            // Send response.created event with full spec fields
+            res.write(`event: response.created\ndata: ${JSON.stringify({
+                type: 'response.created',
+                response: {
+                    id: responseId,
+                    object: 'response',
+                    created_at: createdAt,
+                    completed_at: null,
+                    model,
+                    status: 'in_progress',
+                    error: null,
+                    incomplete_details: null,
+                    instructions: payload.instructions ?? null,
+                    max_output_tokens: payload.max_output_tokens ?? null,
+                    output: [],
+                    parallel_tool_calls: true,
+                    previous_response_id: payload.previous_response_id ?? null,
+                    reasoning: {
+                        effort: payload.reasoning?.effort ?? null,
+                        summary: null
+                    },
+                    store: payload.store ?? true,
+                    temperature: payload.temperature ?? 1.0,
+                    text: {
+                        format: payload.text?.format ?? {
+                            type: 'text'
+                        }
+                    },
+                    tool_choice: payload.tool_choice ?? 'auto',
+                    tools: payload.tools ?? [],
+                    top_p: payload.top_p ?? 1.0,
+                    truncation: payload.truncation ?? 'disabled',
+                    usage: null,
+                    user: null,
+                    metadata: payload.metadata ?? {}
+                }
+            })}\n\n`);
+            // Send response.output_item.added event (before content_part.added)
+            res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+                type: 'response.output_item.added',
+                output_index: 0,
+                item: {
+                    type: 'message',
+                    id: messageId,
+                    status: 'in_progress',
+                    role: 'assistant',
+                    content: []
+                }
+            })}\n\n`);
+            // Send content_part.added event
+            res.write(`event: response.content_part.added\ndata: ${JSON.stringify({
+                type: 'response.content_part.added',
+                item_id: messageId,
+                output_index: 0,
+                content_index: 0,
+                part: { type: 'output_text', text: '', annotations: [] }
+            })}\n\n`);
+            // Stream the content
+            for await (const part of lmResponse.stream) {
+                if (cts.token.isCancellationRequested) {
+                    break;
+                }
+                let textValue;
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    textValue = part.value;
+                }
+                else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
+                    textValue = this.extractTextFromPart(part);
+                }
+                if (textValue) {
+                    totalContent += textValue;
+                    res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
+                        type: 'response.output_text.delta',
+                        item_id: messageId,
+                        content_index: 0,
+                        delta: textValue
+                    })}\n\n`);
+                }
+            }
+            if (!cts.token.isCancellationRequested) {
+                // Send content_part.done event
+                res.write(`event: response.content_part.done\ndata: ${JSON.stringify({
+                    type: 'response.content_part.done',
+                    item_id: messageId,
+                    output_index: 0,
+                    content_index: 0,
+                    part: { type: 'output_text', text: totalContent, annotations: [] }
+                })}\n\n`);
+                // Send response.output_item.done event
+                res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+                    type: 'response.output_item.done',
+                    output_index: 0,
+                    item: {
+                        type: 'message',
+                        id: messageId,
+                        status: 'completed',
+                        role: 'assistant',
+                        content: [{ type: 'output_text', text: totalContent, annotations: [] }]
+                    }
+                })}\n\n`);
+                // Send response.completed event
+                let inputTokens = 0;
+                let outputTokens = 0;
+                try {
+                    const promptStr = messages.map(m => String(m.content)).join('\n');
+                    inputTokens = await selectedModel.countTokens(promptStr);
+                    outputTokens = await selectedModel.countTokens(totalContent);
+                }
+                catch (e) { }
+                const completedAt = Math.floor(Date.now() / 1000);
+                res.write(`event: response.completed\ndata: ${JSON.stringify({
+                    type: 'response.completed',
+                    response: {
+                        id: responseId,
+                        object: 'response',
+                        created_at: createdAt,
+                        completed_at: completedAt,
+                        model,
+                        status: 'completed',
+                        error: null,
+                        incomplete_details: null,
+                        instructions: payload.instructions ?? null,
+                        max_output_tokens: payload.max_output_tokens ?? null,
+                        output: [{
+                                type: 'message',
+                                id: messageId,
+                                status: 'completed',
+                                role: 'assistant',
+                                content: [{ type: 'output_text', text: totalContent, annotations: [] }]
+                            }],
+                        parallel_tool_calls: true,
+                        previous_response_id: payload.previous_response_id ?? null,
+                        reasoning: {
+                            effort: payload.reasoning?.effort ?? null,
+                            summary: null
+                        },
+                        store: payload.store ?? true,
+                        temperature: payload.temperature ?? 1.0,
+                        text: {
+                            format: payload.text?.format ?? {
+                                type: 'text'
+                            }
+                        },
+                        tool_choice: payload.tool_choice ?? 'auto',
+                        tools: payload.tools ?? [],
+                        top_p: payload.top_p ?? 1.0,
+                        truncation: payload.truncation ?? 'disabled',
+                        usage: {
+                            input_tokens: inputTokens,
+                            input_tokens_details: {
+                                cached_tokens: 0
+                            },
+                            output_tokens: outputTokens,
+                            output_tokens_details: {
+                                reasoning_tokens: 0
+                            },
+                            total_tokens: inputTokens + outputTokens
+                        },
+                        user: null,
+                        metadata: payload.metadata ?? {}
+                    }
+                })}\n\n`);
+                res.end();
+                if (logRequestId) {
+                    this.logRequest(logRequestId, 'POST', '/v1/responses', 200, Date.now() - (logRequestStart || 0), {
+                        requestPayload: payload,
+                        responsePayload: { id: responseId, content: totalContent },
+                        tokensIn: inputTokens,
+                        tokensOut: outputTokens,
+                        model
+                    });
+                }
+            }
+        }
+        catch (error) {
+            if (cts.token.isCancellationRequested) {
+                return;
+            }
+            console.error('Responses API streaming error:', error);
+            const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'api_error');
+            res.write(`event: error\ndata: ${JSON.stringify({
+                type: 'error',
+                error: { type: apiError.type, message: apiError.message, code: apiError.code }
+            })}\n\n`);
+            res.end();
+        }
+        finally {
+            clearInterval(heartbeat);
+            cts.dispose();
+        }
+    }
+    async processAnthropicMessages(payload) {
+        const messages = [];
+        const systemTextNS = typeof payload.system === 'string'
+            ? payload.system
+            : Array.isArray(payload.system)
+                ? payload.system.map((b) => b.text || '').join('\n')
+                : '';
+        if (systemTextNS) {
+            messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(systemTextNS)));
+        }
+        for (const msg of payload.messages) {
+            const role = msg.role === 'user' ? vscode.LanguageModelChatMessageRole.User : vscode.LanguageModelChatMessageRole.Assistant;
+            const content = this.flattenMessageContent(msg.content);
+            const redactedContent = this.redactPromptString(content);
+            if (role === vscode.LanguageModelChatMessageRole.User) {
+                messages.push(vscode.LanguageModelChatMessage.User(redactedContent));
+            }
+            else {
+                messages.push(vscode.LanguageModelChatMessage.Assistant(redactedContent));
+            }
+        }
+        const resolvedModel = this.resolveModel(payload.model);
+        // Use sendRequest directly to preserve message structure instead of flattening to string
+        const text = await this.runWithConcurrency(async () => {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            const lmModel = this.findModel(resolvedModel, copilotModels);
+            if (!lmModel) {
+                throw new ApiError(404, `Model "${resolvedModel}" not found.Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
+            }
+            const result = await lmModel.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
+            let output = '';
+            for await (const part of result.stream) {
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    output += part.value;
+                }
+                else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
+                    const textValue = this.extractTextFromPart(part);
+                    if (textValue) {
+                        output += textValue;
+                    }
+                }
+            }
+            return output;
+        });
+        // Count tokens
+        // Count tokens
+        let inputTokens = 0;
+        let outputTokens = 0;
+        try {
+            const promptStr = messages.map(m => m.content).join(' ');
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (copilotModels && copilotModels.length > 0) {
+                const lmModel = copilotModels[0];
+                inputTokens = await lmModel.countTokens(promptStr);
+                outputTokens = await lmModel.countTokens(text || '');
+            }
+        }
+        catch (e) {
+            console.error('Anthropic token counting failed:', e);
+        }
+        return {
+            id: 'ant-' + randomUUID(),
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: text || '' }],
+            model: resolvedModel,
+            stop_reason: 'end_turn',
+            stop_sequence: null,
+            usage: {
+                input_tokens: inputTokens,
+                output_tokens: outputTokens
+            }
+        };
+    }
+    async processGoogleGenerateContent(modelId, payload) {
+        const messages = [];
+        if (payload.systemInstruction) {
+            const systemText = payload.systemInstruction.parts.map(p => p.text).join(' ');
+            messages.push(vscode.LanguageModelChatMessage.User(this.redactPromptString(systemText)));
+        }
+        for (const content of payload.contents) {
+            const role = content.role === 'model' ? vscode.LanguageModelChatMessageRole.Assistant : vscode.LanguageModelChatMessageRole.User;
+            const text = content.parts.map(p => p.text).join(' ');
+            const redactedText = this.redactPromptString(text);
+            if (role === vscode.LanguageModelChatMessageRole.User) {
+                messages.push(vscode.LanguageModelChatMessage.User(redactedText));
+            }
+            else {
+                messages.push(vscode.LanguageModelChatMessage.Assistant(redactedText));
+            }
+        }
+        const resolvedModel = this.resolveModel(modelId);
+        const promptStr = messages.map(m => {
+            if (typeof m.content === 'string') {
+                return m.content;
+            }
+            return m.content.map(p => {
+                if ('text' in p) {
+                    return p.text;
+                }
+                return '';
+            }).join(' ');
+        }).join('\n');
+        // Use sendRequest directly to preserve message structure instead of flattening to string
+        const text = await this.runWithConcurrency(async () => {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            const lmModel = this.findModel(resolvedModel, copilotModels);
+            if (!lmModel) {
+                throw new ApiError(404, `Model "${resolvedModel}" not found.Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
+            }
+            const result = await lmModel.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
+            let output = '';
+            for await (const part of result.stream) {
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    output += part.value;
+                }
+                else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
+                    const textValue = this.extractTextFromPart(part);
+                    if (textValue) {
+                        output += textValue;
+                    }
+                }
+            }
+            return output;
+        });
+        // Count tokens
+        // Count tokens
+        let inputTokens = 0;
+        let outputTokens = 0;
+        try {
+            const promptStr = messages.map(m => m.content).join(' ');
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (copilotModels && copilotModels.length > 0) {
+                const lmModel = copilotModels[0];
+                inputTokens = await lmModel.countTokens(promptStr);
+                outputTokens = await lmModel.countTokens(text || '');
+            }
+        }
+        catch (e) {
+            console.error('Google token counting failed:', e);
+        }
+        return {
+            candidates: [
+                {
+                    content: {
+                        role: 'model',
+                        parts: [{ text: text || '' }]
+                    },
+                    finishReason: 'STOP',
+                    index: 0
+                }
+            ],
+            usageMetadata: {
+                promptTokenCount: inputTokens,
+                candidatesTokenCount: outputTokens,
+                totalTokenCount: inputTokens + outputTokens
+            }
+        };
+    }
+    async processChatCompletion(payload, context) {
+        let messages = this.normalizeChatMessages(payload);
+        messages = this.injectSystemPrompt(messages);
+        // Apply redaction to OUTBOUND messages before sending to Copilot
+        messages = this.redactMessagesContent(messages);
+        const model = this.resolveModel(payload?.model);
+        const customProviderModel = await this.findCustomProviderModel(model);
+        if (customProviderModel) {
+            return this.proxyChatCompletion(customProviderModel, payload);
+        }
+        // Validate model exists
+        const copilotModels = await selectChatModelsSafe(this.output);
+        if (!copilotModels || copilotModels.length === 0) {
+            throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+        }
+        const selectedModel = this.findModel(model, copilotModels);
+        if (!selectedModel) {
+            throw new ApiError(404, `Model "${model}" not found.Available models: ${copilotModels.map(m => m.id).join(', ')}`, 'invalid_request_error', 'model_not_found');
+        }
+        const baseTools = this.normalizeTools(payload?.tools || payload?.functions) || [];
+        // Fetch MCP Tools (lazy load if available)
+        const mcpService = await this.ensureMcpService();
+        const mcpTools = mcpService ? await mcpService.getAllTools() : [];
+        const mappedMcpTools = mcpTools.map(t => ({
+            name: `mcp_${t.serverName}_${t.name}`,
+            description: t.description || `Tool from MCP server ${t.serverName}`,
+            inputSchema: t.inputSchema
+        }));
+        const allTools = [...baseTools, ...mappedMcpTools];
+        const toolChoice = payload?.tool_choice || payload?.function_call;
+        const responseFormat = payload?.response_format;
+        // Handle JSON mode by injecting instruction
+        if (responseFormat?.type === 'json_object') {
+            const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
+            if (lastUserIdx >= 0) {
+                const originalContent = messages[lastUserIdx].content;
+                messages[lastUserIdx] = {
+                    ...messages[lastUserIdx],
+                    content: `${originalContent}\n\nIMPORTANT: You MUST respond with valid JSON only.No markdown, no explanation, just pure JSON.`
+                };
+            }
+        }
+        let iterations = 0;
+        const MAX_ITERATIONS = 5;
+        let result;
+        while (iterations < MAX_ITERATIONS) {
+            result = await this.runWithConcurrency(() => this.invokeCopilotWithTools(messages, allTools, toolChoice, selectedModel));
+            if (result.toolCalls && result.toolCalls.length > 0) {
+                const mcpToolCalls = result.toolCalls.filter((tc) => tc.name.startsWith('mcp_'));
+                if (mcpToolCalls.length > 0) {
+                    // Add assistant message with tool calls to history
+                    messages.push({
+                        role: 'assistant',
+                        content: result.content || null,
+                        tool_calls: result.toolCalls.map((tc) => ({
+                            id: `call_${randomUUID().slice(0, 24)} `,
+                            type: 'function',
+                            function: {
+                                name: tc.name,
+                                arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments)
+                            }
+                        }))
+                    });
+                    // Execute MCP tools
+                    for (const tc of mcpToolCalls) {
+                        const parts = tc.name.split('_');
+                        const serverName = parts[1];
+                        const toolName = parts.slice(2).join('_');
+                        try {
+                            const mcp = await this.ensureMcpService();
+                            if (!mcp) {
+                                throw new Error('MCP service not available');
+                            }
+                            const toolResult = await mcp.callTool(serverName, toolName, tc.arguments);
+                            messages.push({
+                                role: 'tool',
+                                tool_call_id: `call_${randomUUID().slice(0, 24)} `, // Best effort ID mapping
+                                content: JSON.stringify(toolResult)
+                            });
+                        }
+                        catch (error) {
+                            messages.push({
+                                role: 'tool',
+                                tool_call_id: `call_${randomUUID().slice(0, 24)} `,
+                                content: `Error executing MCP tool: ${error.message} `
+                            });
+                        }
+                    }
+                    iterations++;
+                    continue; // Loop again with tool results
+                }
+            }
+            // If we get here, either no tool calls or no MCP tool calls
+            break;
+        }
+        // Calculate tokens for final state
+        const created = Math.floor(Date.now() / 1000);
+        let promptTokens = 0;
+        let completionTokens = 0;
+        try {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (copilotModels && copilotModels.length > 0) {
+                const lmModel = copilotModels[0];
+                // Count input tokens for the whole history
+                const inputStr = messages.map(m => {
+                    // @ts-ignore
+                    return typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+                }).join('\n');
+                promptTokens = await lmModel.countTokens(inputStr);
+                // Count output tokens for the final response
+                const outputStr = result.content || '';
+                const toolStr = result.toolCalls ? JSON.stringify(result.toolCalls) : '';
+                completionTokens = await lmModel.countTokens(outputStr + toolStr);
+            }
+        }
+        catch (e) {
+            console.error('Token counting failed:', e);
+        }
+        // Check if the FINAL iteration requested tool calls (that we didn't handle, i.e. client tools)
+        if (result.toolCalls && result.toolCalls.length > 0) {
+            return {
+                id: `chatcmpl - ${randomUUID()} `,
+                object: 'chat.completion',
+                created,
+                model,
+                choices: [
+                    {
+                        index: 0,
+                        message: {
+                            role: 'assistant',
+                            content: result.content || null,
+                            tool_calls: result.toolCalls.map((tc, idx) => ({
+                                id: `call_${randomUUID().slice(0, 24)} `,
+                                type: 'function',
+                                function: {
+                                    name: tc.name,
+                                    arguments: typeof tc.arguments === 'string'
+                                        ? tc.arguments
+                                        : JSON.stringify(tc.arguments)
+                                }
+                            }))
+                        },
+                        finish_reason: 'tool_calls'
+                    }
+                ],
+                usage: {
+                    prompt_tokens: promptTokens,
+                    completion_tokens: completionTokens,
+                    total_tokens: promptTokens + completionTokens
+                },
+                system_fingerprint: null
+            };
+        }
+        // Normal text response
+        return {
+            id: `chatcmpl - ${randomUUID()} `,
+            object: 'chat.completion',
+            created,
+            model,
+            actual_model: selectedModel?.id || 'unknown',
+            choices: [
+                {
+                    index: 0,
+                    message: {
+                        role: 'assistant',
+                        content: result.content,
+                    },
+                    finish_reason: 'stop'
+                }
+            ],
+            usage: {
+                prompt_tokens: promptTokens,
+                completion_tokens: completionTokens,
+                total_tokens: promptTokens + completionTokens
+            },
+            system_fingerprint: null
+        };
+    }
+    normalizeTools(tools) {
+        if (!tools || !Array.isArray(tools) || tools.length === 0) {
+            return undefined;
+        }
+        return tools.map((tool) => {
+            // Handle OpenAI format: { type: 'function', function: { name, description, parameters } }
+            const fn = tool.type === 'function' ? tool.function : tool;
+            return {
+                name: fn.name,
+                description: fn.description || '',
+                inputSchema: fn.parameters || fn.inputSchema || undefined
+            };
+        });
+    }
+    async invokeCopilotWithTools(chatMessages, tools, toolChoice, selectedModel) {
+        const health = await this.getCopilotHealth();
+        if (!health.installed) {
+            throw new ApiError(503, 'GitHub Copilot extension is not installed. Install it from the VS Code Marketplace: https://marketplace.visualstudio.com/items?itemName=GitHub.copilot', 'service_unavailable', 'copilot_not_installed');
+        }
+        if (!health.chatInstalled) {
+            throw new ApiError(503, 'GitHub Copilot Chat extension is not installed. Install it from the VS Code Marketplace: https://marketplace.visualstudio.com/items?itemName=GitHub.copilot-chat', 'service_unavailable', 'copilot_chat_not_installed');
+        }
+        if (!health.signedIn) {
+            throw new ApiError(401, 'Not signed in to GitHub Copilot. Open VS Code Command Palette (Cmd+Shift+P) and run "GitHub Copilot: Sign In".', 'unauthorized', 'copilot_not_signed_in');
+        }
+        // Use passed model or fall back to first available
+        let model = selectedModel;
+        if (!model) {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            model = copilotModels[0];
+        }
+        // Convert messages to VS Code format
+        const lmMessages = [];
+        for (const msg of chatMessages) {
+            const content = this.flattenMessageContent(msg.content);
+            switch (msg.role) {
+                case 'system':
+                    lmMessages.push(vscode.LanguageModelChatMessage.User(`[System]: ${content} `));
+                    break;
+                case 'user':
+                    lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+                    break;
+                case 'assistant':
+                    if (msg.tool_calls && msg.tool_calls.length > 0) {
+                        // Assistant message with tool calls - include tool call info
+                        const toolCallInfo = msg.tool_calls.map((tc) => `[Called function: $ { tc.function?.name || tc.name } (${tc.function?.arguments || JSON.stringify(tc.arguments)})]`).join('\n');
+                        lmMessages.push(vscode.LanguageModelChatMessage.Assistant(toolCallInfo));
+                    }
+                    else {
+                        lmMessages.push(vscode.LanguageModelChatMessage.Assistant(content));
+                    }
+                    break;
+                case 'tool':
+                    // Tool result message
+                    const toolResultContent = `[Tool result for ${msg.tool_call_id || 'unknown'}]: ${content} `;
+                    lmMessages.push(vscode.LanguageModelChatMessage.User(toolResultContent));
+                    break;
+                default:
+                    lmMessages.push(vscode.LanguageModelChatMessage.User(content));
+            }
+        }
+        // Build request options
+        const options = {};
+        if (tools && tools.length > 0) {
+            options.tools = tools;
+            // Set tool mode based on tool_choice
+            if (toolChoice === 'required' || toolChoice === 'any') {
+                options.toolMode = vscode.LanguageModelChatToolMode.Required;
+            }
+            else {
+                options.toolMode = vscode.LanguageModelChatToolMode.Auto;
+            }
+        }
+        // Create a cancellation token with timeout
+        const cts = new vscode.CancellationTokenSource();
+        const timeout = setTimeout(() => cts.cancel(), (this.config.requestTimeoutSeconds || 180) * 1000);
+        try {
+            const response = await model.sendRequest(lmMessages, options, cts.token);
+            let textContent = '';
+            const toolCalls = [];
+            // Process the response stream
+            for await (const part of response.stream) {
+                if (cts.token.isCancellationRequested) {
+                    throw new ApiError(504, `Request timed out after ${this.config.requestTimeoutSeconds} s.Try a shorter prompt or check your network connection.`, 'gateway_timeout', 'request_timeout');
+                }
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    textContent += part.value;
+                }
+                else if (part instanceof vscode.LanguageModelToolCallPart) {
+                    toolCalls.push({
+                        name: part.name,
+                        arguments: part.input
+                    });
+                }
+                else {
+                    // Handle unknown part types (e.g. LanguageModelThinkingPart from reasoning models)
+                    const textValue = this.extractTextFromPart(part);
+                    if (textValue) {
+                        textContent += textValue;
+                    }
+                }
+            }
+            return {
+                content: textContent.trim(),
+                toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+            };
+        }
+        catch (error) {
+            if (error instanceof ApiError) {
+                throw error;
+            }
+            if (cts.token.isCancellationRequested) {
+                throw new ApiError(504, 'Request timed out waiting for Copilot response.', 'gateway_timeout', 'request_timeout');
+            }
+            throw new ApiError(502, `Failed to retrieve Copilot response: ${getErrorMessage(error)} `, 'bad_gateway', 'command_failed', { cause: error });
+        }
+        finally {
+            clearTimeout(timeout);
+            cts.dispose();
+        }
+    }
+    async processCompletion(payload) {
+        let prompt = this.normalizePromptInput(payload?.prompt);
+        if (!prompt) {
+            throw new ApiError(400, 'prompt is required', 'invalid_request_error', 'missing_prompt');
+        }
+        // Apply redaction to OUTBOUND prompt before sending to Copilot
+        prompt = this.redactPromptString(prompt);
+        const model = this.resolveModel(payload?.model);
+        // Validate model exists
+        const copilotModels = await selectChatModelsSafe(this.output);
+        if (!copilotModels || copilotModels.length === 0) {
+            throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+        }
+        const selectedModel = this.findModel(model, copilotModels);
+        if (!selectedModel) {
+            throw new ApiError(404, `Model "${model}" not found.Available models: ${copilotModels.map(m => m.id).join(', ')} `, 'invalid_request_error', 'model_not_found');
+        }
+        const text = await this.runWithConcurrency(() => this.invokeCopilot(prompt, selectedModel));
+        // Calculate tokens
+        const created = Math.floor(Date.now() / 1000);
+        let promptTokens = 0;
+        let completionTokens = 0;
+        try {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (copilotModels && copilotModels.length > 0) {
+                const lmModel = copilotModels[0];
+                // Count input tokens
+                const inputStr = prompt;
+                promptTokens = await lmModel.countTokens(inputStr);
+                // Count output tokens
+                const outputStr = text || '';
+                completionTokens = await lmModel.countTokens(outputStr);
+            }
+        }
+        catch (e) {
+            console.error('Token counting failed:', e);
+        }
+        return {
+            id: `cmpl - ${randomUUID()} `,
+            object: 'text_completion',
+            created,
+            model,
+            choices: [
+                {
+                    index: 0,
+                    text,
+                    finish_reason: 'stop',
+                    logprobs: null
+                }
+            ],
+            usage: {
+                prompt_tokens: promptTokens,
+                completion_tokens: completionTokens,
+                total_tokens: promptTokens + completionTokens
+            }
+        };
+    }
+    async processStreamingCompletion(payload, req, res, logRequestId, logRequestStart) {
+        let prompt = this.normalizePromptInput(payload?.prompt);
+        if (!prompt) {
+            throw new ApiError(400, 'prompt is required', 'invalid_request_error', 'missing_prompt');
+        }
+        // Apply redaction
+        prompt = this.redactPromptString(prompt);
+        const model = this.resolveModel(payload?.model);
+        const completionId = `cmpl - ${randomUUID()} `;
+        const created = Math.floor(Date.now() / 1000);
+        // Set SSE headers
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        });
+        const cts = new vscode.CancellationTokenSource();
+        req.on('close', () => {
+            cts.cancel();
+            console.log(`[Completions] Client disconnected, cancelling request ${logRequestId || ''} `);
+        });
+        let totalContent = '';
+        try {
+            const copilotModels = await selectChatModelsSafe(this.output);
+            if (!copilotModels || copilotModels.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            const selectedModel = this.findModel(model, copilotModels);
+            if (!selectedModel) {
+                throw new ApiError(404, `Model "${model}" not found.`, 'invalid_request_error', 'model_not_found');
+            }
+            const lmMessages = [vscode.LanguageModelChatMessage.User(prompt)];
+            const lmResponse = await selectedModel.sendRequest(lmMessages, {}, cts.token);
+            for await (const part of lmResponse.stream) {
+                if (cts.token.isCancellationRequested) {
+                    break;
+                }
+                let textValue;
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    textValue = part.value;
+                }
+                else if (!(part instanceof vscode.LanguageModelToolCallPart)) {
+                    textValue = this.extractTextFromPart(part);
+                }
+                if (textValue) {
+                    totalContent += textValue;
+                    const chunk = {
+                        id: completionId,
+                        object: 'text_completion',
+                        created,
+                        model,
+                        choices: [{
+                                index: 0,
+                                text: textValue,
+                                finish_reason: null,
+                                logprobs: null
+                            }]
+                    };
+                    res.write(`data: ${JSON.stringify(chunk)} \n\n`);
+                }
+            }
+            if (!cts.token.isCancellationRequested) {
+                // Send final chunk with finish_reason
+                const finalChunk = {
+                    id: completionId,
+                    object: 'text_completion',
+                    created,
+                    model,
+                    choices: [{
+                            index: 0,
+                            text: '',
+                            finish_reason: 'stop',
+                            logprobs: null
+                        }]
+                };
+                res.write(`data: ${JSON.stringify(finalChunk)} \n\n`);
+                res.write('data: [DONE]\n\n');
+                res.end();
+                // Log request
+                if (logRequestId) {
+                    let promptTokens = 0;
+                    let completionTokens = 0;
+                    try {
+                        promptTokens = await selectedModel.countTokens(prompt);
+                        completionTokens = await selectedModel.countTokens(totalContent);
+                    }
+                    catch (e) { }
+                    this.logRequest(logRequestId, 'POST', '/v1/completions', 200, Date.now() - (logRequestStart || 0), {
+                        requestPayload: payload,
+                        responsePayload: { id: completionId, text: totalContent },
+                        tokensIn: promptTokens,
+                        tokensOut: completionTokens,
+                        model
+                    });
+                }
+            }
+        }
+        catch (error) {
+            if (cts.token.isCancellationRequested) {
+                return;
+            }
+            console.error('Completions streaming error:', error);
+            const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'api_error');
+            res.write(`data: ${JSON.stringify({ error: { message: apiError.message, type: apiError.type, code: apiError.code } })} \n\n`);
+            res.end();
+        }
+        finally {
+            cts.dispose();
+        }
+    }
+    async handleWebSocketMessage(socket, raw, endpoint) {
+        const text = typeof raw === 'string' ? raw : raw.toString('utf8');
+        let payload;
+        try {
+            payload = JSON.parse(text);
+        }
+        catch (error) {
+            throw new ApiError(400, 'WebSocket payload must be valid JSON.', 'invalid_request_error', 'invalid_json');
+        }
+        const type = payload?.type ?? payload?.event ?? payload?.action;
+        // Handle ping for all endpoints
+        if (type === 'ping') {
+            socket.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            return;
+        }
+        // Handle models.list for all endpoints
+        if (type === 'models.list') {
+            const models = await this.getAvailableModels();
+            socket.send(JSON.stringify({ type: 'models.result', data: { object: 'list', data: models } }));
+            return;
+        }
+        // Route based on endpoint
+        switch (endpoint) {
+            case '/v1/realtime':
+            case '/llama/v1/realtime':
+                await this.handleOpenAIWebSocketMessage(socket, payload, type, endpoint);
+                return;
+            case '/anthropic/v1/realtime':
+                await this.handleAnthropicWebSocketMessage(socket, payload, type);
+                return;
+            case '/google/v1/realtime':
+                await this.handleGoogleWebSocketMessage(socket, payload, type);
+                return;
+            default:
+                throw new ApiError(400, `Unknown WebSocket endpoint: ${endpoint} `, 'invalid_request_error', 'unknown_endpoint');
+        }
+    }
+    async handleOpenAIWebSocketMessage(socket, payload, type, endpoint) {
+        if (!type || type === 'chat.completions.create') {
+            const body = payload?.data ?? payload?.request ?? payload;
+            // Handle max_completion_tokens for Llama endpoint
+            if (endpoint === '/llama/v1/realtime' && body?.max_completion_tokens && !body?.max_tokens) {
+                body.max_tokens = body.max_completion_tokens;
+            }
+            const response = await this.processChatCompletion(body, { source: 'websocket', endpoint });
+            socket.send(JSON.stringify({ type: 'chat.completion.result', data: response }));
+            return;
+        }
+        if (type === 'completions.create') {
+            const body = payload?.data ?? payload?.request ?? payload;
+            const response = await this.processCompletion(body);
+            socket.send(JSON.stringify({ type: 'completion.result', data: response }));
+            return;
+        }
+        throw new ApiError(400, `Unsupported OpenAI WebSocket message type: ${type} `, 'invalid_request_error', 'unsupported_ws_message');
+    }
+    async handleAnthropicWebSocketMessage(socket, payload, type) {
+        if (!type || type === 'messages.create') {
+            const body = payload?.data ?? payload?.request ?? payload;
+            const response = await this.processAnthropicMessages(body);
+            socket.send(JSON.stringify({ type: 'message.result', data: response }));
+            return;
+        }
+        throw new ApiError(400, `Unsupported Anthropic WebSocket message type: ${type} `, 'invalid_request_error', 'unsupported_ws_message');
+    }
+    async handleGoogleWebSocketMessage(socket, payload, type) {
+        if (!type || type === 'generateContent') {
+            const body = payload?.data ?? payload?.request ?? payload;
+            const modelId = payload?.model ?? 'gemini-pro';
+            const response = await this.processGoogleGenerateContent(modelId, body);
+            socket.send(JSON.stringify({ type: 'content.result', data: response }));
+            return;
+        }
+        throw new ApiError(400, `Unsupported Google WebSocket message type: ${type} `, 'invalid_request_error', 'unsupported_ws_message');
+    }
+    handleWebSocketConnection(socket, endpoint) {
+        socket.send(JSON.stringify({
+            type: 'session.created',
+            session: {
+                id: randomUUID(),
+                model: this.config.defaultModel,
+                created: Math.floor(Date.now() / 1000),
+                endpoint
+            }
+        }));
+        socket.on('message', (data) => {
+            void this.handleWebSocketMessage(socket, data, endpoint).catch(error => {
+                if (error instanceof ApiError) {
+                    this.sendWsError(socket, error);
+                }
+                else {
+                    this.logError('Unhandled WebSocket error', error);
+                    this.sendWsError(socket, new ApiError(500, 'An unexpected error occurred.', 'server_error'));
+                }
+            });
+        });
+        socket.on('error', (error) => {
+            this.logError('WebSocket client error', error);
+        });
+    }
+    async runWithConcurrency(task) {
+        if (this.activeRequests >= this.config.maxConcurrentRequests) {
+            throw new ApiError(429, `Too many concurrent requests(max ${this.config.maxConcurrentRequests}).Your request has been queued.Try again in a moment.`, 'rate_limit_exceeded', 'concurrency_limit');
+        }
+        this.activeRequests += 1;
+        try {
+            return await task();
+        }
+        finally {
+            this.activeRequests -= 1;
+        }
+    }
+    async invokeCopilot(prompt, selectedModel) {
+        // Use the VS Code Language Model API to invoke Copilot programmatically
+        // This does NOT open the chat window
+        let model = selectedModel;
+        if (!model) {
+            const models = await selectChatModelsSafe(this.output);
+            if (!models || models.length === 0) {
+                throw new ApiError(503, 'No language model available. Ensure a language model provider (e.g. GitHub Copilot) is installed and signed in.', 'service_unavailable', 'no_models_available');
+            }
+            model = models[0];
+        }
+        const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+        // Create a cancellation token with timeout
+        const cts = new vscode.CancellationTokenSource();
+        const timeout = setTimeout(() => cts.cancel(), (this.config.requestTimeoutSeconds || 180) * 1000);
+        try {
+            const response = await model.sendRequest(messages, {}, cts.token);
+            // Collect all text fragments from the response stream
+            let text = '';
+            for await (const fragment of response.text) {
+                if (cts.token.isCancellationRequested) {
+                    throw new ApiError(504, 'Request timed out waiting for Copilot response.', 'gateway_timeout', 'request_timeout');
+                }
+                text += fragment;
+            }
+            if (!text.trim()) {
+                throw new ApiError(502, 'Copilot did not return any content.', 'bad_gateway', 'empty_response');
+            }
+            return text.trim();
+        }
+        catch (error) {
+            if (error instanceof ApiError) {
+                throw error;
+            }
+            if (cts.token.isCancellationRequested) {
+                throw new ApiError(504, 'Request timed out waiting for Copilot response.', 'gateway_timeout', 'request_timeout');
+            }
+            throw new ApiError(502, `Failed to retrieve Copilot response: ${getErrorMessage(error)} `, 'bad_gateway', 'command_failed', { cause: error });
+        }
+        finally {
+            clearTimeout(timeout);
+            cts.dispose();
+        }
+    }
+    extractTextFromChatResult(result) {
+        if (!result) {
+            return undefined;
+        }
+        if (typeof result === 'string') {
+            return result.trim() || undefined;
+        }
+        if (Array.isArray(result)) {
+            return result.map(part => typeof part === 'string' ? part : '').join(' ').trim() || undefined;
+        }
+        if (typeof result === 'object') {
+            const candidate = result;
+            const response = candidate.response ?? candidate.result ?? candidate.body;
+            if (typeof response === 'string') {
+                return response.trim() || undefined;
+            }
+            if (response && typeof response === 'object') {
+                const maybeText = response.text ?? response.message;
+                if (typeof maybeText === 'string' && maybeText.trim()) {
+                    return maybeText.trim();
+                }
+                const parts = response.responseContent;
+                if (Array.isArray(parts)) {
+                    const joined = parts.map(part => {
+                        if (typeof part === 'string') {
+                            return part;
+                        }
+                        if (part && typeof part === 'object' && typeof part.text === 'string') {
+                            return String(part.text);
+                        }
+                        return '';
+                    }).join('').trim();
+                    if (joined) {
+                        return joined;
+                    }
+                }
+            }
+            if (Array.isArray(candidate.choices) && candidate.choices.length > 0) {
+                const first = candidate.choices[0];
+                if (typeof first?.text === 'string' && first.text.trim()) {
+                    return first.text.trim();
+                }
+                const message = first?.message;
+                if (message && typeof message.content === 'string' && message.content.trim()) {
+                    return message.content.trim();
+                }
+            }
+        }
+        return undefined;
+    }
+    normalizeChatMessages(payload) {
+        const messages = payload?.messages;
+        if (Array.isArray(messages) && messages.length > 0) {
+            return messages.map((message, index) => {
+                const role = typeof message?.role === 'string' ? message.role : index === messages.length - 1 ? 'user' : 'system';
+                return {
+                    role,
+                    content: message?.content,
+                    tool_calls: message?.tool_calls,
+                    tool_call_id: message?.tool_call_id
+                };
+            });
+        }
+        const prompt = this.normalizePromptInput(payload?.prompt ?? payload?.input);
+        if (prompt) {
+            return [{ role: 'user', content: prompt }];
+        }
+        throw new ApiError(400, 'messages must be a non-empty array or prompt must be provided.', 'invalid_request_error', 'missing_messages');
+    }
+    normalizePromptInput(value) {
+        if (typeof value === 'string') {
+            return value.trim() || undefined;
+        }
+        if (Array.isArray(value)) {
+            const joined = value.map(part => typeof part === 'string' ? part : '').join('\n');
+            return joined.trim() || undefined;
+        }
+        return undefined;
+    }
+    composePrompt(messages) {
+        return messages.map(({ role, content }) => {
+            const cleanedRole = role || 'user';
+            const text = this.flattenMessageContent(content);
+            return `[${cleanedRole}]\n${text} `;
+        }).join('\n\n');
+    }
+    flattenMessageContent(content) {
+        if (typeof content === 'string') {
+            return content;
+        }
+        if (content === undefined || content === null) {
+            return '';
+        }
+        if (Array.isArray(content)) {
+            return content.map(part => {
+                if (typeof part === 'string') {
+                    return part;
+                }
+                if (part && typeof part === 'object') {
+                    const p = part;
+                    // Plain text block: {type:'text', text:'...'}
+                    if (typeof p.text === 'string') {
+                        return p.text;
+                    }
+                    // tool_result block: extract nested content
+                    if (p.type === 'tool_result') {
+                        const c = p.content;
+                        if (typeof c === 'string') {
+                            return c;
+                        }
+                        if (Array.isArray(c)) {
+                            return c.map((cp) => cp.text || '').join('\n');
+                        }
+                        return '';
+                    }
+                    // tool_use block: format as a human-readable call summary
+                    if (p.type === 'tool_use') {
+                        return `[Tool call: ${p.name}(${typeof p.input === 'string' ? p.input : JSON.stringify(p.input)})]`;
+                    }
+                }
+                return '';
+            }).join('\n');
+        }
+        return String(content);
+    }
+    /**
+     * Extract text from an unknown stream part (e.g. LanguageModelThinkingPart or future part types).
+     * The VS Code LM API stream type is `AsyncIterable<LanguageModelTextPart | LanguageModelToolCallPart | unknown>`,
+     * meaning newer part types (like thinking parts from reasoning models such as gpt-5-mini) may appear
+     * as `unknown`. This method duck-types them to extract any text content they carry.
+     */
+    extractTextFromPart(part) {
+        if (!part || typeof part !== 'object') {
+            return undefined;
+        }
+        const p = part;
+        // Most part types carry text in `.value` (e.g. LanguageModelTextPart, LanguageModelThinkingPart)
+        if (typeof p.value === 'string') {
+            return p.value;
+        }
+        // Some may use `.text`
+        if (typeof p.text === 'string') {
+            return p.text;
+        }
+        return undefined;
+    }
+    resolveModel(model) {
+        if (typeof model === 'string' && model.trim()) {
+            return model.trim();
+        }
+        return this.config.defaultModel;
+    }
+    buildCustomProviderModelId(providerName, modelId) {
+        return `custom/${this.slugifyProviderName(providerName)}/${modelId}`;
+    }
+    slugifyProviderName(value) {
+        return value
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'provider';
+    }
+    async findCustomProviderModel(requestedModel) {
+        const models = await this.getCustomProviderModels();
+        const routedMatch = models.find(model => model.id === requestedModel);
+        if (routedMatch) {
+            return routedMatch;
+        }
+        const rawMatches = models.filter(model => model.rawModelId === requestedModel);
+        if (rawMatches.length === 1) {
+            return rawMatches[0];
+        }
+        return null;
+    }
+    async resolveProviderModels(provider) {
+        if (!provider.enabled) {
+            return [];
+        }
+        const manualModels = Array.isArray(provider.models) ? provider.models.map(m => m.trim()).filter(Boolean) : [];
+        if (manualModels.length > 0 && provider.autoDiscoverModels === false) {
+            return manualModels;
+        }
+        const now = Date.now();
+        const cache = this.customProviderModelCache.get(provider.baseUrl);
+        if (cache && cache.expires > now) {
+            return manualModels.length > 0 ? manualModels : cache.models;
+        }
+        try {
+            const fetched = await this.fetchCustomProviderModels(provider);
+            const ids = fetched.map(model => model.id);
+            this.customProviderModelCache.set(provider.baseUrl, { models: ids, expires: now + this.CUSTOM_PROVIDER_CACHE_TTL_MS });
+            if (manualModels.length > 0) {
+                return Array.from(new Set([...manualModels, ...ids]));
+            }
+            return ids;
+        }
+        catch {
+            return manualModels;
+        }
+    }
+    async getCustomProviderModels() {
+        const entries = [];
+        for (const provider of this.config.customProviders) {
+            const models = await this.resolveProviderModels(provider);
+            for (const rawModelId of models) {
+                entries.push({
+                    id: this.buildCustomProviderModelId(provider.name, rawModelId),
+                    rawModelId,
+                    provider
+                });
+            }
+        }
+        return entries;
+    }
+    resolveProviderApiKey(provider) {
+        const value = provider.apiKey.trim();
+        const envMatch = value.match(/^\$\{env:([^}]+)\}$/i);
+        if (!envMatch) {
+            return value;
+        }
+        return process.env[envMatch[1]]?.trim() ?? '';
+    }
+    getCustomProviderHeaders(provider) {
+        const headers = { ...provider.headers };
+        const apiKey = this.resolveProviderApiKey(provider);
+        if (apiKey && !headers.Authorization) {
+            headers.Authorization = `Bearer ${apiKey}`;
+        }
+        return headers;
+    }
+    async proxyChatCompletion(model, payload) {
+        const response = await fetch(`${model.provider.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...this.getCustomProviderHeaders(model.provider)
+            },
+            body: JSON.stringify({
+                ...payload,
+                model: model.rawModelId
+            })
+        });
+        if (!response.ok) {
+            const text = await response.text();
+            throw new ApiError(response.status, text || `Custom provider ${model.provider.name} request failed.`, 'bad_gateway', 'custom_provider_error');
+        }
+        return await response.json();
+    }
+    async proxyStreamingChatCompletion(model, payload, res) {
+        const response = await fetch(`${model.provider.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...this.getCustomProviderHeaders(model.provider)
+            },
+            body: JSON.stringify({
+                ...payload,
+                model: model.rawModelId,
+                stream: true
+            })
+        });
+        if (!response.ok || !response.body) {
+            const text = await response.text();
+            throw new ApiError(response.status, text || `Custom provider ${model.provider.name} stream failed.`, 'bad_gateway', 'custom_provider_error');
+        }
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        });
+        for await (const chunk of response.body) {
+            res.write(chunk);
+        }
+        res.end();
+    }
+    async processCustomProviderResponsesApi(model, exposedModel, payload) {
+        const chatPayload = buildResponsesCustomProviderChatPayload(payload, model.rawModelId, this.config.defaultSystemPrompt);
+        const response = await fetch(`${model.provider.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...this.getCustomProviderHeaders(model.provider)
+            },
+            body: JSON.stringify({
+                ...this.buildResponsesCustomProviderOptions(payload),
+                ...chatPayload
+            })
+        });
+        if (!response.ok) {
+            const text = await response.text();
+            throw new ApiError(response.status, text || `Custom provider ${model.provider.name} request failed.`, 'bad_gateway', 'custom_provider_error');
+        }
+        const body = await response.json();
+        return mapChatCompletionToResponsesApiResponse(payload, exposedModel, body);
+    }
+    async processStreamingCustomProviderResponsesApi(model, exposedModel, payload, req, res, logRequestId, logRequestStart) {
+        const chatPayload = buildResponsesCustomProviderChatPayload(payload, model.rawModelId, this.config.defaultSystemPrompt);
+        const response = await fetch(`${model.provider.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...this.getCustomProviderHeaders(model.provider)
+            },
+            body: JSON.stringify({
+                ...this.buildResponsesCustomProviderOptions(payload),
+                ...chatPayload,
+                stream: true,
+                stream_options: {
+                    include_usage: true
+                }
+            })
+        });
+        if (!response.ok || !response.body) {
+            const text = await response.text();
+            throw new ApiError(response.status, text || `Custom provider ${model.provider.name} stream failed.`, 'bad_gateway', 'custom_provider_error');
+        }
+        const responseId = `resp-${randomUUID()}`;
+        const messageId = `msg-${randomUUID()}`;
+        const createdAt = Math.floor(Date.now() / 1000);
+        let totalContent = '';
+        let promptTokens = 0;
+        let completionTokens = 0;
+        let totalTokens = 0;
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        });
+        res.write(`event: response.created\ndata: ${JSON.stringify({
+            type: 'response.created',
+            response: {
+                id: responseId,
+                object: 'response',
+                created_at: createdAt,
+                completed_at: null,
+                model: exposedModel,
+                status: 'in_progress',
+                error: null,
+                incomplete_details: null,
+                instructions: payload.instructions ?? null,
+                max_output_tokens: payload.max_output_tokens ?? null,
+                output: [],
+                parallel_tool_calls: true,
+                previous_response_id: payload.previous_response_id ?? null,
+                reasoning: {
+                    effort: payload.reasoning?.effort ?? null,
+                    summary: null
+                },
+                store: payload.store ?? true,
+                temperature: payload.temperature ?? 1.0,
+                text: {
+                    format: payload.text?.format ?? { type: 'text' }
+                },
+                tool_choice: payload.tool_choice ?? 'auto',
+                tools: payload.tools ?? [],
+                top_p: payload.top_p ?? 1.0,
+                truncation: payload.truncation ?? 'disabled',
+                usage: null,
+                user: null,
+                metadata: payload.metadata ?? {}
+            }
+        })}\n\n`);
+        res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+            type: 'response.output_item.added',
+            output_index: 0,
+            item: {
+                type: 'message',
+                id: messageId,
+                status: 'in_progress',
+                role: 'assistant',
+                content: []
+            }
+        })}\n\n`);
+        res.write(`event: response.content_part.added\ndata: ${JSON.stringify({
+            type: 'response.content_part.added',
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            part: { type: 'output_text', text: '', annotations: [] }
+        })}\n\n`);
+        const abortController = new AbortController();
+        req.on('close', () => {
+            abortController.abort();
+        });
+        let buffer = '';
+        let done = false;
+        const reader = response.body.getReader();
+        while (!done) {
+            const chunk = await reader.read();
+            if (chunk.done) {
+                break;
+            }
+            buffer += Buffer.from(chunk.value).toString('utf8');
+            while (true) {
+                const eventBoundary = buffer.indexOf('\n\n');
+                if (eventBoundary === -1) {
+                    break;
+                }
+                const rawEvent = buffer.slice(0, eventBoundary);
+                buffer = buffer.slice(eventBoundary + 2);
+                const data = rawEvent
+                    .split('\n')
+                    .filter(line => line.startsWith('data:'))
+                    .map(line => line.slice(5).trim())
+                    .join('\n');
+                if (!data) {
+                    continue;
+                }
+                if (data === '[DONE]') {
+                    done = true;
+                    break;
+                }
+                const parsed = JSON.parse(data);
+                const delta = extractChatCompletionTextContent(parsed.choices?.[0]?.delta?.content);
+                if (delta) {
+                    totalContent += delta;
+                    res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
+                        type: 'response.output_text.delta',
+                        item_id: messageId,
+                        content_index: 0,
+                        delta
+                    })}\n\n`);
+                }
+                if (parsed.usage) {
+                    promptTokens = parsed.usage.prompt_tokens ?? promptTokens;
+                    completionTokens = parsed.usage.completion_tokens ?? completionTokens;
+                    totalTokens = parsed.usage.total_tokens ?? totalTokens;
+                }
+            }
+        }
+        const completedAt = Math.floor(Date.now() / 1000);
+        res.write(`event: response.content_part.done\ndata: ${JSON.stringify({
+            type: 'response.content_part.done',
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            part: { type: 'output_text', text: totalContent, annotations: [] }
+        })}\n\n`);
+        res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+            type: 'response.output_item.done',
+            output_index: 0,
+            item: {
+                type: 'message',
+                id: messageId,
+                status: 'completed',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: totalContent, annotations: [] }]
+            }
+        })}\n\n`);
+        res.write(`event: response.completed\ndata: ${JSON.stringify({
+            type: 'response.completed',
+            response: {
+                id: responseId,
+                object: 'response',
+                created_at: createdAt,
+                completed_at: completedAt,
+                model: exposedModel,
+                status: 'completed',
+                error: null,
+                incomplete_details: null,
+                instructions: payload.instructions ?? null,
+                max_output_tokens: payload.max_output_tokens ?? null,
+                output: [{
+                        type: 'message',
+                        id: messageId,
+                        status: 'completed',
+                        role: 'assistant',
+                        content: [{ type: 'output_text', text: totalContent, annotations: [] }]
+                    }],
+                parallel_tool_calls: true,
+                previous_response_id: payload.previous_response_id ?? null,
+                reasoning: {
+                    effort: payload.reasoning?.effort ?? null,
+                    summary: null
+                },
+                store: payload.store ?? true,
+                temperature: payload.temperature ?? 1.0,
+                text: {
+                    format: payload.text?.format ?? { type: 'text' }
+                },
+                tool_choice: payload.tool_choice ?? 'auto',
+                tools: payload.tools ?? [],
+                top_p: payload.top_p ?? 1.0,
+                truncation: payload.truncation ?? 'disabled',
+                usage: {
+                    input_tokens: promptTokens,
+                    input_tokens_details: {
+                        cached_tokens: 0
+                    },
+                    output_tokens: completionTokens,
+                    output_tokens_details: {
+                        reasoning_tokens: 0
+                    },
+                    total_tokens: totalTokens || promptTokens + completionTokens
+                },
+                user: null,
+                metadata: payload.metadata ?? {}
+            }
+        })}\n\n`);
+        res.end();
+        if (logRequestId) {
+            this.logRequest(logRequestId, 'POST', '/v1/responses', 200, Date.now() - (logRequestStart || 0), {
+                requestPayload: payload,
+                responsePayload: { id: responseId, content: totalContent },
+                tokensIn: promptTokens,
+                tokensOut: completionTokens,
+                model: exposedModel
+            });
+        }
+    }
+    buildResponsesCustomProviderOptions(payload) {
+        const options = {};
+        if (payload.tools) {
+            options.tools = payload.tools;
+        }
+        if (payload.tool_choice !== undefined) {
+            options.tool_choice = payload.tool_choice;
+        }
+        if (payload.temperature !== undefined) {
+            options.temperature = payload.temperature;
+        }
+        if (payload.top_p !== undefined) {
+            options.top_p = payload.top_p;
+        }
+        if (payload.max_output_tokens !== undefined) {
+            options.max_tokens = payload.max_output_tokens;
+        }
+        if (payload.text?.format?.type === 'json_object') {
+            options.response_format = { type: 'json_object' };
+        }
+        return options;
+    }
+    /**
+     * Find a language model matching the requested model ID.
+     * Searches across ALL registered VS Code language model providers.
+     * STRICT MODE: Exact match only. Returns null if not found.
+     */
+    findModel(requestedModel, availableModels) {
+        if (!availableModels || availableModels.length === 0) {
+            return null;
+        }
+        const requested = requestedModel.toLowerCase();
+        // 1. Exact match on model id
+        const exactMatch = availableModels.find(m => m.id.toLowerCase() === requested);
+        if (exactMatch) {
+            return exactMatch;
+        }
+        // 2. Exact match on family (e.g., "gpt-4o" matches family "gpt-4o")
+        const familyMatch = availableModels.find(m => m.family?.toLowerCase() === requested);
+        if (familyMatch) {
+            return familyMatch;
+        }
+        // No match found - strict mode, no fallbacks
+        return null;
+    }
+    injectSystemPrompt(messages) {
+        if (!this.config.defaultSystemPrompt) {
+            return messages;
+        }
+        // Check if there's already a system message
+        const hasSystem = messages.some(m => m.role === 'system');
+        if (hasSystem) {
+            return messages;
+        }
+        // Inject default system prompt at the beginning
+        return [{ role: 'system', content: this.config.defaultSystemPrompt }, ...messages];
+    }
+    async readJsonBody(req) {
+        const chunks = [];
+        let totalSize = 0;
+        await new Promise((resolve, reject) => {
+            req.on('data', chunk => {
+                const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+                totalSize += buffer.length;
+                // Check payload size limit
+                const maxPayloadSize = (this.config.maxPayloadSizeMb || 1) * 1024 * 1024;
+                if (totalSize > maxPayloadSize) {
+                    req.destroy();
+                    reject(new ApiError(413, `Request body too large.Maximum size is ${Math.round(maxPayloadSize / 1024)} KB.`, 'invalid_request_error', 'payload_too_large'));
+                    return;
+                }
+                chunks.push(buffer);
+            });
+            req.on('end', () => resolve());
+            req.on('error', error => reject(error));
+        });
+        if (chunks.length === 0) {
+            return {};
+        }
+        const raw = Buffer.concat(chunks).toString('utf8');
+        try {
+            return parseJsonBody(raw);
+        }
+        catch (error) {
+            throw new ApiError(400, 'Request body must be valid JSON.', 'invalid_request_error', 'invalid_json', { cause: error });
+        }
+    }
+    sendJson(res, status, body) {
+        if (!res.headersSent) {
+            res.statusCode = status;
+            res.setHeader('Content-Type', 'application/json');
+        }
+        res.end(JSON.stringify(body));
+    }
+    sendSwaggerUi(res) {
+        // Use CDN for swagger-ui assets to reduce bundle size
+        const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>proxy - Swagger UI</title>
+	<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+	<style>
+		body { margin: 0; background: #fafafa; }
+		.swagger-ui .topbar { display: none; }
+		.swagger-ui .info { margin: 30px 0; }
+		.swagger-ui .info .title { font-size: 2em; }
+	</style>
+</head>
+<body>
+	<div id="swagger-ui"></div>
+	<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+	<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+	<script>
+		window.onload = function() {
+			SwaggerUIBundle({
+				url: '/openapi.json',
+				dom_id: '#swagger-ui',
+				presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+				layout: 'BaseLayout',
+				deepLinking: true,
+				showExtensions: true,
+				showCommonExtensions: true
+			});
+		};
+	</script>
+</body>
+</html>`;
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html');
+        res.end(html);
+    }
+    getOpenApiSpec() {
+        const url = '/';
+        return {
+            openapi: '3.1.0',
+            info: {
+                title: 'proxy Gateway',
+                description: 'Local multi-provider API server powered by VS Code language models and custom providers. Provides REST and WebSocket endpoints for chat completions, text completions, tokenization, and more.',
+                version: '1.0.0',
+                contact: {
+                    name: 'proxy VS Code Extension'
+                },
+                license: {
+                    name: 'MIT'
+                }
+            },
+            servers: [{ url, description: 'Local proxy API server' }],
+            tags: [
+                { name: 'Chat', description: 'Chat completion endpoints' },
+                { name: 'Completions', description: 'Text completion endpoints' },
+                { name: 'Anthropic', description: 'Anthropic Messages API compatible endpoints' },
+                { name: 'Google', description: 'Google Generative AI API compatible endpoints' },
+                { name: 'Llama', description: 'Meta Llama API compatible endpoints' },
+                { name: 'Models', description: 'Model information' },
+                { name: 'Utilities', description: 'Utility endpoints' },
+                { name: 'Tools', description: 'MCP and VS Code tool endpoints' },
+                { name: 'WebSocket', description: 'Real-time WebSocket endpoints for all providers' }
+            ],
+            paths: {
+                '/v1/chat/completions': {
+                    post: {
+                        tags: ['Chat'],
+                        summary: 'Create chat completion',
+                        description: 'Creates a chat completion for the given messages using the OpenAI format.\n\n**Supported Features:**\n- **Streaming:** Server-Sent Events (SSE)\n- **Function Calling:** Tool use with `tools` and `tool_choice`\n- **JSON Mode:** Structured output with `response_format`\n- **Token usage:** Detailed usage statistics',
+                        operationId: 'createChatCompletion',
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/ChatCompletionRequest' },
+                                    examples: {
+                                        basic: {
+                                            summary: 'Basic chat',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                messages: [{ role: 'user', content: 'Hello!' }]
+                                            }
+                                        },
+                                        streaming: {
+                                            summary: 'Streaming response',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                messages: [{ role: 'user', content: 'Tell me a story' }],
+                                                stream: true
+                                            }
+                                        },
+                                        tools: {
+                                            summary: 'With tools/functions',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                messages: [{ role: 'user', content: 'What is the weather?' }],
+                                                tools: [{
+                                                        type: 'function',
+                                                        function: {
+                                                            name: 'get_weather',
+                                                            description: 'Get weather for a location',
+                                                            parameters: {
+                                                                type: 'object',
+                                                                properties: { location: { type: 'string' } },
+                                                                required: ['location']
+                                                            }
+                                                        }
+                                                    }]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Successful response',
+                                content: {
+                                    'application/json': {
+                                        schema: { $ref: '#/components/schemas/ChatCompletionResponse' }
+                                    },
+                                    'text/event-stream': {
+                                        description: 'Server-sent events for streaming responses'
+                                    }
+                                }
+                            },
+                            '400': { description: 'Bad request', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+                            '401': { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+                            '429': { description: 'Rate limited', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/completions': {
+                    post: {
+                        tags: ['Completions'],
+                        summary: 'Create text completion',
+                        description: 'Creates a text completion for the given prompt.\n\n**Features:**\n- **Streaming:** Server-Sent Events with `stream: true`\n- **Token usage:** Detailed usage statistics',
+                        operationId: 'createCompletion',
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/CompletionRequest' },
+                                    examples: {
+                                        basic: {
+                                            summary: 'Basic completion',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                prompt: 'Once upon a time',
+                                                max_tokens: 100
+                                            }
+                                        },
+                                        streaming: {
+                                            summary: 'Streaming response',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                prompt: 'Write a story about',
+                                                stream: true
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Successful response',
+                                content: {
+                                    'application/json': { schema: { $ref: '#/components/schemas/CompletionResponse' } },
+                                    'text/event-stream': { description: 'SSE stream when stream=true' }
+                                }
+                            },
+                            '400': { description: 'Bad request' },
+                            '401': { description: 'Unauthorized' }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/responses': {
+                    post: {
+                        tags: ['Chat'],
+                        summary: 'Create response (OpenAI 2026 Responses API)',
+                        description: 'OpenAI Responses API for creating model responses. Supports streaming via SSE.\n\n**Features:**\n- **Streaming:** Server-Sent Events with `stream: true`\n- **Instructions:** System prompt via `instructions` field\n- **Multi-turn:** Array-based `input` for conversations\n- **Codex CLI compatible**',
+                        operationId: 'createResponse',
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/ResponsesRequest' },
+                                    examples: {
+                                        basic: {
+                                            summary: 'Simple text input',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                input: 'What is 2+2?'
+                                            }
+                                        },
+                                        withInstructions: {
+                                            summary: 'With system instructions',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                input: 'Write a haiku about coding',
+                                                instructions: 'You are a creative poet. Be concise and artistic.'
+                                            }
+                                        },
+                                        streaming: {
+                                            summary: 'Streaming response',
+                                            value: {
+                                                model: this.config.defaultModel,
+                                                input: 'Tell me a story',
+                                                stream: true
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Successful response',
+                                content: {
+                                    'application/json': { schema: { $ref: '#/components/schemas/ResponsesResponse' } },
+                                    'text/event-stream': { description: 'SSE stream when stream=true' }
+                                }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/models': {
+                    get: {
+                        tags: ['Models'],
+                        summary: 'List models',
+                        description: 'Lists all available models from GitHub Copilot.',
+                        operationId: 'listModels',
+                        responses: {
+                            '200': {
+                                description: 'List of models',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/ModelList' } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/models/{model_id}': {
+                    get: {
+                        tags: ['Models'],
+                        summary: 'Get model',
+                        description: 'Retrieves details about a specific model.',
+                        operationId: 'getModel',
+                        parameters: [{
+                                name: 'model_id',
+                                in: 'path',
+                                required: true,
+                                schema: { type: 'string' },
+                                description: 'The ID of the model'
+                            }],
+                        responses: {
+                            '200': {
+                                description: 'Model details',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/Model' } } }
+                            },
+                            '404': { description: 'Model not found' }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/tokenize': {
+                    post: {
+                        tags: ['Utilities'],
+                        summary: 'Count tokens',
+                        description: 'Counts the number of tokens in the given text.',
+                        operationId: 'tokenize',
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/TokenizeRequest' },
+                                    example: { model: this.config.defaultModel, text: 'Hello, world!' }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Token count',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/TokenizeResponse' } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/usage': {
+                    get: {
+                        tags: ['Utilities'],
+                        summary: 'Get usage statistics',
+                        description: 'Returns usage statistics including request counts, token usage, and uptime.',
+                        operationId: 'getUsage',
+                        responses: {
+                            '200': {
+                                description: 'Usage statistics',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/UsageResponse' } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/tools': {
+                    get: {
+                        tags: ['Tools'],
+                        summary: 'List available tools',
+                        description: 'Lists all available tools from connected MCP servers and VS Code built-in tools.',
+                        operationId: 'listTools',
+                        responses: {
+                            '200': {
+                                description: 'List of tools',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/ToolList' } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/tools/call': {
+                    post: {
+                        tags: ['Tools'],
+                        summary: 'Call a tool',
+                        description: 'Invokes a specific tool from an MCP server or VS Code built-in tools.',
+                        operationId: 'callTool',
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/ToolCallRequest' },
+                                    example: {
+                                        server: 'vscode',
+                                        name: 'readFile',
+                                        arguments: { path: '/path/to/file.txt' }
+                                    }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Tool result',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/ToolCallResponse' } } }
+                            },
+                            '400': { description: 'Bad request' },
+                            '503': { description: 'MCP service unavailable' }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/mcp/servers': {
+                    get: {
+                        tags: ['Tools'],
+                        summary: 'List MCP servers',
+                        description: 'Lists all connected MCP servers and their available tools.',
+                        operationId: 'listMcpServers',
+                        responses: {
+                            '200': {
+                                description: 'List of MCP servers',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/McpServerList' } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/mcp/servers/refresh': {
+                    post: {
+                        tags: ['Tools'],
+                        summary: 'Refresh MCP connections',
+                        description: 'Reconnects to all configured MCP servers.',
+                        operationId: 'refreshMcpServers',
+                        responses: {
+                            '200': {
+                                description: 'Refresh result',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/McpRefreshResponse' } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1/messages': {
+                    post: {
+                        tags: ['Anthropic'],
+                        summary: 'Anthropic Messages API',
+                        description: 'Create a message using the Anthropic-compatible API format.',
+                        operationId: 'anthropicMessages',
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/AnthropicMessageRequest' },
+                                    example: {
+                                        model: 'claude-3-5-sonnet-20240620',
+                                        max_tokens: 1024,
+                                        messages: [
+                                            { role: 'user', content: 'Hello, Claude' }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Successful response',
+                                content: {
+                                    'application/json': { schema: { $ref: '#/components/schemas/AnthropicMessageResponse' } },
+                                    'text/event-stream': { description: 'Anthropic-style event stream' }
+                                }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1beta/models/{model}:generateContent': {
+                    post: {
+                        tags: ['Google'],
+                        summary: 'Google Generative AI generateContent',
+                        description: 'Generate content using the Google-compatible API format.',
+                        operationId: 'googleGenerateContent',
+                        parameters: [{ name: 'model', in: 'path', required: true, schema: { type: 'string' } }],
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/GoogleGenerateContentRequest' },
+                                    example: {
+                                        contents: [
+                                            {
+                                                role: 'user',
+                                                parts: [{ text: 'Write a story about a magic backpack' }]
+                                            }
+                                        ],
+                                        generationConfig: {
+                                            temperature: 0.9,
+                                            maxOutputTokens: 200
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Successful response',
+                                content: { 'application/json': { schema: { $ref: '#/components/schemas/GoogleGenerateContentResponse' } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/v1beta/models/{model}:streamGenerateContent': {
+                    post: {
+                        tags: ['Google'],
+                        summary: 'Google Generative AI streamGenerateContent',
+                        description: 'Stream content generation using the Google-compatible API format.',
+                        operationId: 'googleStreamGenerateContent',
+                        parameters: [{ name: 'model', in: 'path', required: true, schema: { type: 'string' } }],
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/GoogleGenerateContentRequest' }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Successful response',
+                                content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/GoogleGenerateContentResponse' } } } }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/llama/v1/chat/completions': {
+                    post: {
+                        tags: ['Llama'],
+                        summary: 'Llama Chat Completions',
+                        description: 'Create a chat completion using the Llama-compatible API format.\n\nCompatible with `llama-api` Python/JS SDKs. Supports standard OpenAI parameters including `max_completion_tokens`.',
+                        operationId: 'llamaChatCompletions',
+                        requestBody: {
+                            required: true,
+                            content: {
+                                'application/json': {
+                                    schema: { $ref: '#/components/schemas/LlamaMessageRequest' }
+                                }
+                            }
+                        },
+                        responses: {
+                            '200': {
+                                description: 'Successful response',
+                                content: {
+                                    'application/json': { schema: { $ref: '#/components/schemas/LlamaMessageResponse' } },
+                                    'text/event-stream': { description: 'OpenAI-style SSE event stream for streaming responses' }
+                                }
+                            }
+                        },
+                        security: this.config.apiKey ? [{ bearerAuth: [] }] : []
+                    }
+                },
+                '/health': {
+                    get: {
+                        tags: ['Utilities'],
+                        summary: 'Health check',
+                        description: 'Simple health check endpoint for monitoring.',
+                        operationId: 'healthCheck',
+                        responses: {
+                            '200': {
+                                description: 'Service is healthy',
+                                content: {
+                                    'application/json': {
+                                        schema: {
+                                            type: 'object',
+                                            properties: {
+                                                status: { type: 'string', example: 'ok' },
+                                                service: { type: 'string', example: 'proxy' }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                '/v1/realtime': {
+                    get: {
+                        tags: ['WebSocket'],
+                        summary: 'OpenAI Realtime WebSocket',
+                        description: 'Initiate a WebSocket connection for real-time chat completions using the OpenAI format. Requires `Upgrade: websocket` header.',
+                        operationId: 'connectOpenAIRealtime',
+                        responses: {
+                            '101': { description: 'Switching Protocols to WebSocket' },
+                            '426': { description: 'Upgrade Required - Use WebSocket client' }
+                        }
+                    }
+                },
+                '/anthropic/v1/realtime': {
+                    get: {
+                        tags: ['WebSocket', 'Anthropic'],
+                        summary: 'Anthropic Realtime WebSocket',
+                        description: 'Initiate a WebSocket connection using the Anthropic Messages API format.',
+                        operationId: 'connectAnthropicRealtime',
+                        responses: {
+                            '101': { description: 'Switching Protocols to WebSocket' },
+                            '426': { description: 'Upgrade Required - Use WebSocket client' }
+                        }
+                    }
+                },
+                '/google/v1/realtime': {
+                    get: {
+                        tags: ['WebSocket', 'Google'],
+                        summary: 'Google Realtime WebSocket',
+                        description: 'Initiate a WebSocket connection using the Google Gemini format.',
+                        operationId: 'connectGoogleRealtime',
+                        responses: {
+                            '101': { description: 'Switching Protocols to WebSocket' },
+                            '426': { description: 'Upgrade Required - Use WebSocket client' }
+                        }
+                    }
+                },
+                '/llama/v1/realtime': {
+                    get: {
+                        tags: ['WebSocket', 'Llama'],
+                        summary: 'Llama Realtime WebSocket',
+                        description: 'Initiate a WebSocket connection using the Llama/OpenAI format.',
+                        operationId: 'connectLlamaRealtime',
+                        responses: {
+                            '101': { description: 'Switching Protocols to WebSocket' },
+                            '426': { description: 'Upgrade Required - Use WebSocket client' }
+                        }
+                    }
+                }
+            },
+            components: {
+                securitySchemes: {
+                    bearerAuth: {
+                        type: 'http',
+                        scheme: 'bearer',
+                        description: 'API key authentication (optional, configure in extension settings)'
+                    }
+                },
+                schemas: {
+                    ChatCompletionRequest: {
+                        type: 'object',
+                        required: ['model', 'messages'],
+                        properties: {
+                            model: { type: 'string', description: 'Model ID to use', example: this.config.defaultModel },
+                            messages: {
+                                type: 'array',
+                                items: { $ref: '#/components/schemas/Message' },
+                                description: 'List of messages in the conversation'
+                            },
+                            stream: { type: 'boolean', default: false, description: 'Enable streaming responses' },
+                            temperature: { type: 'number', minimum: 0, maximum: 2, description: 'Sampling temperature' },
+                            max_tokens: { type: 'integer', description: 'Maximum tokens to generate' },
+                            max_completion_tokens: { type: 'integer', description: 'Maximum completion tokens (GPT-5.x style, auto-normalized to max_tokens)' },
+                            reasoning_effort: { type: 'string', enum: ['low', 'medium', 'high', 'minimal', 'none', 'xhigh'], description: 'Reasoning effort for o-series models' },
+                            tools: {
+                                type: 'array',
+                                items: { $ref: '#/components/schemas/Tool' },
+                                description: 'List of tools/functions available'
+                            },
+                            tool_choice: { type: 'string', description: 'How to select tools: auto, none, or specific' },
+                            response_format: {
+                                type: 'object',
+                                properties: { type: { type: 'string', enum: ['text', 'json_object'] } },
+                                description: 'Response format (json_object for JSON mode)'
+                            }
+                        }
+                    },
+                    Message: {
+                        type: 'object',
+                        required: ['role', 'content'],
+                        properties: {
+                            role: { type: 'string', enum: ['system', 'developer', 'user', 'assistant', 'tool'], description: 'Role of the message sender (developer is auto-normalized to system)' },
+                            content: { type: 'string', description: 'Message content' },
+                            name: { type: 'string', description: 'Name of the sender (optional)' },
+                            tool_calls: { type: 'array', items: { $ref: '#/components/schemas/ToolCall' } },
+                            tool_call_id: { type: 'string', description: 'ID of tool call this message responds to' }
+                        }
+                    },
+                    Tool: {
+                        type: 'object',
+                        required: ['type', 'function'],
+                        properties: {
+                            type: { type: 'string', enum: ['function'] },
+                            function: {
+                                type: 'object',
+                                required: ['name'],
+                                properties: {
+                                    name: { type: 'string' },
+                                    description: { type: 'string' },
+                                    parameters: { type: 'object', description: 'JSON Schema for function parameters' }
+                                }
+                            }
+                        }
+                    },
+                    ToolCall: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string' },
+                            type: { type: 'string', enum: ['function'] },
+                            function: {
+                                type: 'object',
+                                properties: {
+                                    name: { type: 'string' },
+                                    arguments: { type: 'string' }
+                                }
+                            }
+                        }
+                    },
+                    ChatCompletionResponse: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string' },
+                            object: { type: 'string', example: 'chat.completion' },
+                            created: { type: 'integer' },
+                            model: { type: 'string' },
+                            choices: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        index: { type: 'integer' },
+                                        message: { $ref: '#/components/schemas/Message' },
+                                        finish_reason: { type: 'string', enum: ['stop', 'length', 'tool_calls'] }
+                                    }
+                                }
+                            },
+                            usage: { $ref: '#/components/schemas/Usage' }
+                        }
+                    },
+                    CompletionRequest: {
+                        type: 'object',
+                        required: ['model', 'prompt'],
+                        properties: {
+                            model: { type: 'string' },
+                            prompt: { type: 'string', description: 'Text prompt to complete' },
+                            max_tokens: { type: 'integer', default: 100 },
+                            temperature: { type: 'number' }
+                        }
+                    },
+                    CompletionResponse: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string' },
+                            object: { type: 'string', example: 'text_completion' },
+                            created: { type: 'integer' },
+                            model: { type: 'string' },
+                            choices: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        text: { type: 'string' },
+                                        index: { type: 'integer' },
+                                        finish_reason: { type: 'string' }
+                                    }
+                                }
+                            },
+                            usage: { $ref: '#/components/schemas/Usage' }
+                        }
+                    },
+                    ResponsesRequest: {
+                        type: 'object',
+                        required: ['input'],
+                        properties: {
+                            model: { type: 'string', description: 'Model ID to use for generation' },
+                            input: {
+                                oneOf: [
+                                    { type: 'string', description: 'Simple text input' },
+                                    {
+                                        type: 'array',
+                                        items: {
+                                            type: 'object',
+                                            properties: {
+                                                role: { type: 'string', enum: ['user', 'assistant', 'system'] },
+                                                content: { type: 'string' }
+                                            }
+                                        },
+                                        description: 'Array of message objects for multi-turn conversations'
+                                    }
+                                ]
+                            },
+                            instructions: { type: 'string', description: 'System prompt / instructions for the model' },
+                            stream: { type: 'boolean', description: 'Enable SSE streaming', default: false },
+                            temperature: { type: 'number', minimum: 0, maximum: 2, description: 'Sampling temperature' },
+                            top_p: { type: 'number', minimum: 0, maximum: 1, description: 'Nucleus sampling parameter' },
+                            max_output_tokens: { type: 'integer', description: 'Maximum tokens to generate' },
+                            tools: { type: 'array', items: { type: 'object' }, description: 'Tool definitions for function calling' },
+                            tool_choice: { type: 'string', description: 'How to select tools: auto, none, or specific' },
+                            metadata: { type: 'object', description: 'Custom metadata key-value pairs' },
+                            reasoning: {
+                                type: 'object',
+                                properties: { effort: { type: 'string', enum: ['low', 'medium', 'high', 'minimal', 'none', 'xhigh'] } },
+                                description: 'Reasoning configuration for o-series models'
+                            },
+                            truncation: { type: 'string', enum: ['auto', 'disabled'], description: 'Context truncation strategy', default: 'disabled' },
+                            store: { type: 'boolean', description: 'Whether to store the response', default: true },
+                            previous_response_id: { type: 'string', description: 'ID of previous response for multi-turn conversations' }
+                        }
+                    },
+                    ResponsesResponse: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string', description: 'Unique response ID' },
+                            object: { type: 'string', enum: ['response'] },
+                            created_at: { type: 'integer', description: 'Unix timestamp' },
+                            model: { type: 'string' },
+                            status: { type: 'string', enum: ['completed', 'failed', 'in_progress', 'cancelled'] },
+                            output: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        type: { type: 'string', enum: ['message'] },
+                                        id: { type: 'string' },
+                                        role: { type: 'string', enum: ['assistant'] },
+                                        content: {
+                                            type: 'array',
+                                            items: {
+                                                type: 'object',
+                                                properties: {
+                                                    type: { type: 'string', enum: ['output_text'] },
+                                                    text: { type: 'string' }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            usage: {
+                                type: 'object',
+                                properties: {
+                                    input_tokens: { type: 'integer' },
+                                    output_tokens: { type: 'integer' },
+                                    total_tokens: { type: 'integer' }
+                                }
+                            }
+                        }
+                    },
+                    TokenizeRequest: {
+                        type: 'object',
+                        required: ['text'],
+                        properties: {
+                            model: { type: 'string' },
+                            text: { type: 'string', description: 'Text to tokenize' }
+                        }
+                    },
+                    TokenizeResponse: {
+                        type: 'object',
+                        properties: {
+                            model: { type: 'string' },
+                            token_count: { type: 'integer' }
+                        }
+                    },
+                    ToolList: {
+                        type: 'object',
+                        properties: {
+                            object: { type: 'string', example: 'list' },
+                            data: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        type: { type: 'string', example: 'function' },
+                                        server: { type: 'string', description: 'MCP server name or "vscode"' },
+                                        function: {
+                                            type: 'object',
+                                            properties: {
+                                                name: { type: 'string' },
+                                                description: { type: 'string' },
+                                                parameters: { type: 'object' }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    ToolCallRequest: {
+                        type: 'object',
+                        required: ['server', 'name'],
+                        properties: {
+                            server: { type: 'string', description: 'MCP server name or "vscode"' },
+                            name: { type: 'string', description: 'Tool name' },
+                            arguments: { type: 'object', description: 'Tool arguments' }
+                        }
+                    },
+                    ToolCallResponse: {
+                        type: 'object',
+                        properties: {
+                            object: { type: 'string', example: 'tool_result' },
+                            server: { type: 'string' },
+                            name: { type: 'string' },
+                            result: { type: 'object', description: 'Result from the tool execution' }
+                        }
+                    },
+                    McpServerList: {
+                        type: 'object',
+                        properties: {
+                            object: { type: 'string', example: 'list' },
+                            data: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        name: { type: 'string' },
+                                        status: { type: 'string' },
+                                        tools: { type: 'array', items: { type: 'string' } }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    McpRefreshResponse: {
+                        type: 'object',
+                        properties: {
+                            object: { type: 'string', example: 'refresh_result' },
+                            message: { type: 'string' },
+                            connected: { type: 'array', items: { type: 'string' } }
+                        }
+                    },
+                    ModelList: {
+                        type: 'object',
+                        properties: {
+                            object: { type: 'string', example: 'list' },
+                            data: { type: 'array', items: { $ref: '#/components/schemas/Model' } }
+                        }
+                    },
+                    Model: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string' },
+                            object: { type: 'string', example: 'model' },
+                            created: { type: 'integer' },
+                            owned_by: { type: 'string' }
+                        }
+                    },
+                    UsageResponse: {
+                        type: 'object',
+                        properties: {
+                            object: { type: 'string', example: 'usage' },
+                            total_requests: { type: 'integer' },
+                            total_tokens: {
+                                type: 'object',
+                                properties: {
+                                    input: { type: 'integer' },
+                                    output: { type: 'integer' },
+                                    total: { type: 'integer' }
+                                }
+                            },
+                            uptime_seconds: { type: 'integer' },
+                            active_requests: { type: 'integer' }
+                        }
+                    },
+                    Usage: {
+                        type: 'object',
+                        properties: {
+                            prompt_tokens: { type: 'integer' },
+                            completion_tokens: { type: 'integer' },
+                            total_tokens: { type: 'integer' }
+                        }
+                    },
+                    Error: {
+                        type: 'object',
+                        properties: {
+                            error: {
+                                type: 'object',
+                                properties: {
+                                    message: { type: 'string' },
+                                    type: { type: 'string' },
+                                    code: { type: 'string' }
+                                }
+                            }
+                        }
+                    },
+                    AnthropicMessageRequest: {
+                        type: 'object',
+                        required: ['model', 'messages'],
+                        properties: {
+                            model: { type: 'string' },
+                            messages: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    required: ['role', 'content'],
+                                    properties: {
+                                        role: { type: 'string', enum: ['user', 'assistant'] },
+                                        content: { type: 'string' }
+                                    }
+                                }
+                            },
+                            system: { type: 'string' },
+                            max_tokens: { type: 'integer' },
+                            stream: { type: 'boolean' }
+                        }
+                    },
+                    AnthropicMessageResponse: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string' },
+                            type: { type: 'string', example: 'message' },
+                            role: { type: 'string', example: 'assistant' },
+                            content: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        type: { type: 'string', example: 'text' },
+                                        text: { type: 'string' }
+                                    }
+                                }
+                            },
+                            model: { type: 'string' },
+                            stop_reason: { type: 'string' },
+                            usage: {
+                                type: 'object',
+                                properties: {
+                                    input_tokens: { type: 'integer' },
+                                    output_tokens: { type: 'integer' }
+                                }
+                            }
+                        }
+                    },
+                    GoogleGenerateContentRequest: {
+                        type: 'object',
+                        required: ['contents'],
+                        properties: {
+                            contents: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    required: ['parts'],
+                                    properties: {
+                                        role: { type: 'string', enum: ['user', 'model'] },
+                                        parts: {
+                                            type: 'array',
+                                            items: {
+                                                type: 'object',
+                                                properties: { text: { type: 'string' } }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            systemInstruction: {
+                                type: 'object',
+                                properties: {
+                                    parts: {
+                                        type: 'array',
+                                        items: {
+                                            type: 'object',
+                                            properties: { text: { type: 'string' } }
+                                        }
+                                    }
+                                }
+                            },
+                            generationConfig: { type: 'object' }
+                        }
+                    },
+                    GoogleGenerateContentResponse: {
+                        type: 'object',
+                        properties: {
+                            candidates: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        content: {
+                                            type: 'object',
+                                            properties: {
+                                                role: { type: 'string' },
+                                                parts: {
+                                                    type: 'array',
+                                                    items: {
+                                                        type: 'object',
+                                                        properties: { text: { type: 'string' } }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        finishReason: { type: 'string' }
+                                    }
+                                }
+                            },
+                            usageMetadata: {
+                                type: 'object',
+                                properties: {
+                                    promptTokenCount: { type: 'integer' },
+                                    candidatesTokenCount: { type: 'integer' },
+                                    totalTokenCount: { type: 'integer' }
+                                }
+                            }
+                        }
+                    },
+                    LlamaMessageRequest: {
+                        type: 'object',
+                        required: ['model', 'messages'],
+                        properties: {
+                            model: { type: 'string', description: 'Model ID to use' },
+                            messages: {
+                                type: 'array',
+                                description: 'List of messages in the conversation',
+                                items: {
+                                    type: 'object',
+                                    required: ['role', 'content'],
+                                    properties: {
+                                        role: { type: 'string', enum: ['system', 'user', 'assistant', 'tool'] },
+                                        content: { type: 'string' }
+                                    }
+                                }
+                            },
+                            temperature: { type: 'number', minimum: 0, maximum: 2 },
+                            max_tokens: { type: 'integer', description: 'Maximum tokens to generate' },
+                            max_completion_tokens: { type: 'integer', description: 'Llama-style max tokens parameter' },
+                            stream: { type: 'boolean', default: false },
+                            top_p: { type: 'number' },
+                            stop: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] }
+                        }
+                    },
+                    LlamaMessageResponse: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string' },
+                            object: { type: 'string', example: 'chat.completion' },
+                            created: { type: 'integer' },
+                            model: { type: 'string' },
+                            choices: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        index: { type: 'integer' },
+                                        message: {
+                                            type: 'object',
+                                            properties: {
+                                                role: { type: 'string', example: 'assistant' },
+                                                content: { type: 'string' }
+                                            }
+                                        },
+                                        finish_reason: { type: 'string', enum: ['stop', 'length', 'tool_calls', 'content_filter'] }
+                                    }
+                                }
+                            },
+                            usage: {
+                                type: 'object',
+                                properties: {
+                                    prompt_tokens: { type: 'integer' },
+                                    completion_tokens: { type: 'integer' },
+                                    total_tokens: { type: 'integer' }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+    }
+    sendError(res, error) {
+        const status = error.status ?? 500;
+        const payload = {
+            error: {
+                message: error.message,
+                type: error.type,
+                code: error.code ?? null,
+                param: null
+            }
+        };
+        this.sendJson(res, status, payload);
+    }
+    sendWsError(socket, error) {
+        socket.send(JSON.stringify({
+            type: 'error',
+            error: {
+                message: error.message,
+                type: error.type,
+                code: error.code ?? null
+            }
+        }));
+    }
+    setCorsHeaders(res) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        // Include x-api-key and anthropic-* headers for Claude Code / Anthropic SDK compatibility
+        res.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, x-requested-with, x-api-key, anthropic-version, anthropic-beta');
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    }
+    checkRateLimit() {
+        if (this.config.rateLimitPerMinute <= 0) {
+            return true; // Rate limiting disabled
+        }
+        const now = Date.now();
+        const windowStart = now - 60000; // 1 minute window
+        // Remove old entries
+        this.rateLimitBucket = this.rateLimitBucket.filter(ts => ts > windowStart);
+        if (this.rateLimitBucket.length >= this.config.rateLimitPerMinute) {
+            return false;
+        }
+        this.rateLimitBucket.push(now);
+        return true;
+    }
+    /**
+     * Extract client IP from request, handling proxies
+     */
+    getClientIp(req) {
+        // Check X-Forwarded-For header for proxied requests
+        const forwarded = req.headers['x-forwarded-for'];
+        if (forwarded) {
+            const ips = typeof forwarded === 'string' ? forwarded : forwarded[0];
+            const firstIp = ips?.split(',')[0]?.trim();
+            if (firstIp) {
+                return firstIp;
+            }
+        }
+        const remoteAddress = req.socket.remoteAddress || 'unknown';
+        // Normalize IPv6 mapped IPv4 addresses
+        return remoteAddress.startsWith('::ffff:') ? remoteAddress.substring(7) : remoteAddress;
+    }
+    checkIpAllowlist(req) {
+        const allowlist = this.config.ipAllowlist;
+        if (!allowlist || allowlist.length === 0) {
+            return true; // No allowlist, allow all
+        }
+        const remoteAddress = req.socket.remoteAddress;
+        if (!remoteAddress) {
+            return false; // Cannot determine IP, block
+        }
+        // Normalize IPv6 mapped IPv4 addresses
+        const ip = remoteAddress.startsWith('::ffff:') ? remoteAddress.substring(7) : remoteAddress;
+        for (const allowed of allowlist) {
+            if (allowed.includes('/')) {
+                // CIDR notation
+                if (this.isIpInCidr(ip, allowed)) {
+                    return true;
+                }
+            }
+            else if (/^[\d\.]+$|^[\da-fA-F:]+$/.test(allowed)) {
+                // Direct IP match
+                if (allowed === ip) {
+                    return true;
+                }
+            }
+            else {
+                // Domain name - check cached resolved IPs
+                const cachedIps = this.domainCache.get(allowed);
+                if (cachedIps && cachedIps.includes(ip)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    /**
+     * Resolve domains in allowlist and cache their IPs
+     * Called periodically to keep cache fresh
+     */
+    async refreshDomainCache() {
+        const dns = await import('dns').then(m => m.promises);
+        for (const entry of this.config.ipAllowlist) {
+            // Check if entry is a domain (contains letters)
+            if (/[a-zA-Z]/.test(entry) && !entry.includes('/')) {
+                try {
+                    const addresses = await dns.resolve4(entry).catch(() => []);
+                    const addresses6 = await dns.resolve6(entry).catch(() => []);
+                    const allIps = [...addresses, ...addresses6];
+                    if (allIps.length > 0) {
+                        this.domainCache.set(entry, allIps);
+                    }
+                }
+                catch {
+                    // DNS resolution failed, skip
+                }
+            }
+        }
+    }
+    isIpInCidr(ip, cidr) {
+        try {
+            const [range, bits] = cidr.split('/');
+            const mask = ~(2 ** (32 - parseInt(bits, 10)) - 1);
+            const ipParts = ip.split('.').map(Number);
+            const rangeParts = range.split('.').map(Number);
+            const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
+            const rangeNum = (rangeParts[0] << 24) | (rangeParts[1] << 16) | (rangeParts[2] << 8) | rangeParts[3];
+            return (ipNum & mask) === (rangeNum & mask);
+        }
+        catch {
+            return false; // Invalid CIDR or IP
+        }
+    }
+    logRequest(requestId, method, path, status, durationMs, extra) {
+        const isError = status >= 400;
+        const tokensIn = extra?.tokensIn ?? 0;
+        const tokensOut = extra?.tokensOut ?? 0;
+        // Always record usage stats
+        this.recordRequestStats(durationMs, tokensIn, tokensOut, isError);
+        // Determine if we should log detailed body/headers
+        // User requested: "i want it to logs request body and response body as well as headers"
+        // We use the existing 'logRequestBodies' config as the gatekeeper for all heavy data
+        // Persistent Logging (Audit Trail)
+        // User requested to always log bodies/headers
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            requestId,
+            method,
+            path,
+            status,
+            durationMs,
+            tokensIn: extra?.tokensIn,
+            tokensOut: extra?.tokensOut,
+            error: extra?.error,
+            model: extra?.model,
+            requestBody: extra?.requestPayload,
+            responseBody: extra?.responsePayload,
+            requestHeaders: extra?.requestHeaders,
+            responseHeaders: extra?.responseHeaders
+        };
+        const redactedEntry = this.redactSensitiveData(logEntry);
+        this.auditService.logRequest(redactedEntry);
+        // Broadcast to internal listeners (like Dashboard)
+        this._onDidLogRequest.fire(redactedEntry);
+        // Broadcast to WebSocket clients for Live Log Tail
+        if (this.wsServer) {
+            const broadcastData = JSON.stringify({
+                type: 'log',
+                data: redactedEntry
+            });
+            this.wsServer.clients.forEach(client => {
+                if (client.readyState === 1 /* OPEN */) {
+                    client.send(broadcastData);
+                }
+            });
+        }
+        // Log to output if logging is enabled
+        if (this.config.enableLogging) {
+            const statusIcon = isError ? '❌' : (status >= 300 ? '⚠️' : '✅');
+            this.output.appendLine(`[${new Date().toLocaleTimeString()}] ${statusIcon} ${method} ${path} ${status} (${durationMs}ms)`);
+            if (extra?.error) {
+                this.output.appendLine(`  Error: ${extra.error}`);
+            }
+        }
+    }
+    getCacheKey(payload) {
+        // Create a stable cache key from the request payload
+        const key = JSON.stringify({
+            model: payload?.model,
+            messages: payload?.messages,
+            prompt: payload?.prompt,
+            tools: payload?.tools,
+            stream: payload?.stream
+        });
+        return key;
+    }
+    getFromCache(cacheKey) {
+        const cached = this.requestCache.get(cacheKey);
+        if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+            return cached.response;
+        }
+        this.requestCache.delete(cacheKey);
+        return undefined;
+    }
+    setCache(cacheKey, response) {
+        // Clean old entries periodically
+        if (this.requestCache.size > 100) {
+            const now = Date.now();
+            for (const [key, value] of this.requestCache.entries()) {
+                if (now - value.timestamp > this.CACHE_TTL_MS) {
+                    this.requestCache.delete(key);
+                }
+            }
+        }
+        this.requestCache.set(cacheKey, { response, timestamp: Date.now() });
+    }
+    buildUrl(rawUrl) {
+        const base = `http://${this.config.host}:${this.config.port}`;
+        const url = new URL(rawUrl ?? '/', base);
+        url.pathname = normalizeOpenAICompatiblePath(url.pathname);
+        return url;
+    }
+    async updateServerConfig(patch) {
+        this.config = { ...this.config, ...patch };
+        this._onDidChangeStatus.fire();
+        const config = vscode.workspace.getConfiguration('githubCopilotApi');
+        const updates = [];
+        if (patch.enabled !== undefined) {
+            updates.push(Promise.resolve(config.update('server.enabled', patch.enabled, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.enableHttp !== undefined) {
+            updates.push(Promise.resolve(config.update('server.enableHttp', patch.enableHttp, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.enableWebSocket !== undefined) {
+            updates.push(Promise.resolve(config.update('server.enableWebSocket', patch.enableWebSocket, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.enableHttps !== undefined) {
+            updates.push(Promise.resolve(config.update('server.enableHttps', patch.enableHttps, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.host !== undefined) {
+            updates.push(Promise.resolve(config.update('server.host', patch.host, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.port !== undefined) {
+            updates.push(Promise.resolve(config.update('server.port', patch.port, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.maxConcurrentRequests !== undefined) {
+            updates.push(Promise.resolve(config.update('server.maxConcurrentRequests', patch.maxConcurrentRequests, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.defaultModel !== undefined) {
+            updates.push(Promise.resolve(config.update('server.defaultModel', patch.defaultModel, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.enableLogging !== undefined) {
+            updates.push(Promise.resolve(config.update('server.enableLogging', patch.enableLogging, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.apiKey !== undefined) {
+            updates.push(Promise.resolve(config.update('server.apiKey', patch.apiKey, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.rateLimitPerMinute !== undefined) {
+            updates.push(Promise.resolve(config.update('server.rateLimitPerMinute', patch.rateLimitPerMinute, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.requestTimeoutSeconds !== undefined) {
+            updates.push(Promise.resolve(config.update('server.requestTimeoutSeconds', patch.requestTimeoutSeconds, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.maxPayloadSizeMb !== undefined) {
+            updates.push(Promise.resolve(config.update('server.maxPayloadSizeMb', patch.maxPayloadSizeMb, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.maxConnectionsPerIp !== undefined) {
+            updates.push(Promise.resolve(config.update('server.maxConnectionsPerIp', patch.maxConnectionsPerIp, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.cloudflaredPath !== undefined) {
+            updates.push(Promise.resolve(config.update('tunnel.cloudflaredPath', patch.cloudflaredPath, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.redactionPatterns !== undefined) {
+            updates.push(Promise.resolve(config.update('server.redactionPatterns', patch.redactionPatterns, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.ipAllowlist !== undefined) {
+            updates.push(Promise.resolve(config.update('server.ipAllowlist', patch.ipAllowlist, vscode.ConfigurationTarget.Global)));
+        }
+        if (patch.customProviders !== undefined) {
+            updates.push(Promise.resolve(config.update('server.customProviders', patch.customProviders, vscode.ConfigurationTarget.Global)));
+        }
+        this.suppressRestart = true;
+        try {
+            await Promise.all(updates);
+        }
+        finally {
+            this.suppressRestart = false;
+        }
+        await this.restart();
+    }
+    updateStatusBar(state, detail) {
+        const protocolText = `${this.config.enableHttp ? 'HTTP' : ''}${this.config.enableHttp && this.config.enableWebSocket ? '+' : ''}${this.config.enableWebSocket ? 'WS' : ''}` || 'disabled';
+        if (state === 'starting') {
+            this.statusItem.text = '$(broadcast) proxy: Starting…';
+            this.statusItem.tooltip = 'Starting proxy gateway';
+            this.statusItem.show();
+            return;
+        }
+        if (state === 'running') {
+            this.statusItem.text = `$(broadcast) proxy: On (${protocolText})`;
+            const location = `${this.config.host}:${this.config.port}`;
+            this.statusItem.tooltip = detail ? detail : `proxy is running on ${location}`;
+            this.statusItem.show();
+            return;
+        }
+        this.statusItem.text = '$(broadcast) proxy: Off';
+        this.statusItem.tooltip = detail ?? 'proxy gateway is stopped';
+        this.statusItem.hide();
+    }
+    async showControlPalette() {
+        const cfg = vscode.workspace.getConfiguration('githubCopilotApi');
+        const items = [
+            { label: '$(check) Start HTTP + WebSocket', description: 'Enable and start all endpoints' },
+            { label: '$(primitive-square) Stop Server', description: 'Disable all endpoints' },
+            { label: `${this.config.enableHttp ? '$(circle-slash)' : '$(play)'} Toggle HTTP`, description: this.config.enableHttp ? 'Disable HTTP REST endpoints' : 'Enable HTTP REST endpoints' },
+            { label: `${this.config.enableWebSocket ? '$(circle-slash)' : '$(play)'} Toggle WebSocket`, description: this.config.enableWebSocket ? 'Disable WebSocket realtime endpoint' : 'Enable WebSocket realtime endpoint' },
+            { label: '$(globe) Listen on localhost', description: 'Bind to 127.0.0.1' },
+            { label: '$(rss) Listen on all interfaces', description: 'Bind to 0.0.0.0 for LAN access' },
+            { label: '$(plug) Change port', description: `Current: ${this.config.port}` },
+            { label: '$(settings) Open settings', description: 'Open proxy settings' }
+        ];
+        const selection = await vscode.window.showQuickPick(items, {
+            placeHolder: 'proxy controls'
+        });
+        if (!selection) {
+            return;
+        }
+        if (selection.label.includes('Start')) {
+            await cfg.update('server.enabled', true, vscode.ConfigurationTarget.Global);
+            await cfg.update('server.enableHttp', true, vscode.ConfigurationTarget.Global);
+            await cfg.update('server.enableWebSocket', true, vscode.ConfigurationTarget.Global);
+            return;
+        }
+        if (selection.label.includes('Stop')) {
+            await cfg.update('server.enabled', false, vscode.ConfigurationTarget.Global);
+            return;
+        }
+        if (selection.label.includes('Toggle HTTP')) {
+            await cfg.update('server.enableHttp', !this.config.enableHttp, vscode.ConfigurationTarget.Global);
+            await cfg.update('server.enabled', true, vscode.ConfigurationTarget.Global);
+            return;
+        }
+        if (selection.label.includes('Toggle WebSocket')) {
+            await cfg.update('server.enableWebSocket', !this.config.enableWebSocket, vscode.ConfigurationTarget.Global);
+            await cfg.update('server.enabled', true, vscode.ConfigurationTarget.Global);
+            return;
+        }
+        if (selection.label.includes('localhost')) {
+            await cfg.update('server.host', '127.0.0.1', vscode.ConfigurationTarget.Global);
+            await cfg.update('server.enabled', true, vscode.ConfigurationTarget.Global);
+            return;
+        }
+        if (selection.label.includes('all interfaces')) {
+            await cfg.update('server.host', '0.0.0.0', vscode.ConfigurationTarget.Global);
+            await cfg.update('server.enabled', true, vscode.ConfigurationTarget.Global);
+            return;
+        }
+        if (selection.label.includes('Change port')) {
+            const value = await vscode.window.showInputBox({
+                title: 'Set API server port',
+                value: String(this.config.port),
+                validateInput: input => {
+                    const num = Number(input);
+                    if (!Number.isFinite(num) || num <= 0 || num > 65535) {
+                        return 'Enter a valid port between 1 and 65535';
+                    }
+                    return null;
+                }
+            });
+            if (value) {
+                await cfg.update('server.port', Number(value), vscode.ConfigurationTarget.Global);
+                await cfg.update('server.enabled', true, vscode.ConfigurationTarget.Global);
+            }
+            return;
+        }
+        if (selection.label.includes('settings')) {
+            await vscode.commands.executeCommand('proxy.openSettings');
+        }
+    }
+    logInfo(message) {
+        this.output.appendLine(`[${new Date().toISOString()}] INFO ${message}`);
+    }
+    logError(message, error) {
+        this.output.appendLine(`[${new Date().toISOString()}] ERROR ${message}: ${getErrorMessage(error)}`);
+    }
+}
+export async function ensureCopilotChatReady() {
+    const extension = vscode.extensions.getExtension(COPILOT_CHAT_EXTENSION_ID);
+    if (extension) {
+        if (!extension.isActive) {
+            try {
+                await extension.activate();
+            }
+            catch (error) {
+                void vscode.window.showErrorMessage(`Failed to activate GitHub Copilot Chat: ${getErrorMessage(error)}`);
+                return false;
+            }
+        }
+        return true;
+    }
+    // VS Code forks (e.g. Cursor) typically do not ship GitHub Copilot Chat, but still expose
+    // vscode.lm chat models. Treat any available LM as sufficient for chat commands.
+    const models = await selectChatModelsSafe(undefined, SELECT_CHAT_MODELS_TIMEOUT_MS);
+    if (models.length > 0) {
+        return true;
+    }
+    const isCursor = /cursor/i.test(vscode.env.appName ?? '');
+    if (isCursor) {
+        const choice = await vscode.window.showWarningMessage('No language models available. Enable models in Cursor settings and ensure you are signed in.', 'Open Settings', 'Cancel');
+        if (choice === 'Open Settings') {
+            await vscode.commands.executeCommand('workbench.action.openSettings');
+        }
+        return false;
+    }
+    const choice = await vscode.window.showWarningMessage('GitHub Copilot Chat extension is required. Install it from the Marketplace to continue.', 'Open Marketplace', 'Cancel');
+    if (choice === 'Open Marketplace') {
+        await vscode.commands.executeCommand('workbench.extensions.search', COPILOT_CHAT_SEARCH_QUERY);
+    }
+    return false;
+}
+export function normalizePrompt(raw) {
+    if (typeof raw === 'string') {
+        return raw.trim() || undefined;
+    }
+    if (Array.isArray(raw)) {
+        return raw.map(part => typeof part === 'string' ? part : '').join(' ').trim() || undefined;
+    }
+    return undefined;
+}
+function getServerConfig() {
+    const configuration = vscode.workspace.getConfiguration('githubCopilotApi');
+    const enabled = configuration.get('server.enabled', false);
+    const enableHttp = configuration.get('server.enableHttp', true);
+    const enableWebSocket = configuration.get('server.enableWebSocket', true);
+    const enableHttps = configuration.get('server.enableHttps', false);
+    const tlsCertPath = configuration.get('server.tlsCertPath', '').trim();
+    const tlsKeyPath = configuration.get('server.tlsKeyPath', '').trim();
+    const host = configuration.get('server.host', '127.0.0.1').trim() || '127.0.0.1';
+    const rawPort = configuration.get('server.port', 3030);
+    const port = Number.isFinite(rawPort) ? Math.max(1, Math.floor(rawPort)) : 3030;
+    const rawConcurrency = configuration.get('server.maxConcurrentRequests', 4);
+    const maxConcurrentRequests = Number.isFinite(rawConcurrency) ? Math.max(1, Math.floor(rawConcurrency)) : 4;
+    const defaultModel = (configuration.get('server.defaultModel', 'gpt-4o-copilot') ?? 'gpt-4o-copilot').trim() || 'gpt-4o-copilot';
+    const apiKey = configuration.get('server.apiKey', '').trim();
+    const enableLogging = configuration.get('server.enableLogging', false);
+    const rawRateLimit = configuration.get('server.rateLimitPerMinute', 60);
+    const rateLimitPerMinute = Number.isFinite(rawRateLimit) ? Math.max(0, Math.floor(rawRateLimit)) : 60;
+    const defaultSystemPrompt = configuration.get('server.defaultSystemPrompt', '').trim();
+    // Read stored patterns and merge with defaults
+    const storedPatterns = configuration.get('server.redactionPatterns', []);
+    // Migrate from old string[] format to new RedactionPattern[] format
+    const parsedPatterns = storedPatterns.map((p, i) => {
+        if (typeof p === 'string') {
+            // Old format - migrate to new
+            return {
+                id: `migrated-${i}`,
+                name: `Custom Pattern ${i + 1}`,
+                pattern: p,
+                enabled: true,
+                isBuiltin: false
+            };
+        }
+        // New format
+        return p;
+    });
+    // Merge with defaults: use stored state for builtin patterns, add missing defaults
+    const redactionPatterns = [];
+    // First, add all default patterns (use stored enabled state if available)
+    for (const defaultPattern of DEFAULT_REDACTION_PATTERNS) {
+        const storedVersion = parsedPatterns.find(p => p.id === defaultPattern.id);
+        if (storedVersion) {
+            redactionPatterns.push({ ...defaultPattern, enabled: storedVersion.enabled });
+        }
+        else {
+            redactionPatterns.push(defaultPattern);
+        }
+    }
+    // Then add all custom (non-builtin) patterns
+    for (const pattern of parsedPatterns) {
+        if (!pattern.isBuiltin) {
+            redactionPatterns.push(pattern);
+        }
+    }
+    const ipAllowlist = configuration.get('server.ipAllowlist', []);
+    const requestTimeoutSeconds = configuration.get('server.requestTimeoutSeconds', 180);
+    const maxPayloadSizeMb = configuration.get('server.maxPayloadSizeMb', 1);
+    const maxConnectionsPerIp = configuration.get('server.maxConnectionsPerIp', 10);
+    const mcpEnabled = vscode.workspace.getConfiguration('githubCopilotApi.mcp').get('enabled', true);
+    const cloudflaredPath = vscode.workspace.getConfiguration('githubCopilotApi.tunnel').get('cloudflaredPath', '').trim();
+    const rawCustomProviders = configuration.get('server.customProviders', []);
+    const customProviders = rawCustomProviders
+        .map(parseCustomProviderConfig)
+        .filter((provider) => provider !== null);
+    return {
+        enabled, enableHttp, enableWebSocket, enableHttps, tlsCertPath, tlsKeyPath, host, port, maxConcurrentRequests,
+        defaultModel, apiKey, enableLogging, rateLimitPerMinute, defaultSystemPrompt,
+        redactionPatterns, ipAllowlist, requestTimeoutSeconds, maxPayloadSizeMb, maxConnectionsPerIp,
+        mcpEnabled, cloudflaredPath, customProviders
+    };
+}
+function parseCustomProviderConfig(raw) {
+    if (!raw || typeof raw !== 'object') {
+        return null;
+    }
+    const entry = raw;
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    const baseUrl = typeof entry.baseUrl === 'string' ? entry.baseUrl.trim().replace(/\/+$/, '') : '';
+    const models = Array.isArray(entry.models)
+        ? entry.models
+            .filter((value) => typeof value === 'string' && value.trim().length > 0)
+            .map(value => value.trim())
+        : [];
+    if (!name || !baseUrl || models.length === 0) {
+        return null;
+    }
+    const headers = {};
+    if (entry.headers && typeof entry.headers === 'object' && !Array.isArray(entry.headers)) {
+        for (const [key, value] of Object.entries(entry.headers)) {
+            if (key.trim() && typeof value === 'string') {
+                headers[key.trim()] = value;
+            }
+        }
+    }
+    return {
+        name,
+        baseUrl,
+        apiKey: typeof entry.apiKey === 'string' ? entry.apiKey : '',
+        models,
+        headers,
+        enabled: entry.enabled !== false,
+        autoDiscoverModels: entry.autoDiscoverModels !== false
+    };
+}
+export function getErrorMessage(error) {
+    if (error instanceof Error && error.message) {
+        return error.message;
+    }
+    return String(error);
+}
+//# sourceMappingURL=CopilotApiGateway.js.map
