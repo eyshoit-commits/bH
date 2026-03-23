@@ -1,0 +1,10 @@
+{
+	"servers": {
+		"my-mcp-server-474bef5b": {
+			"type": "stdio",
+			"command": "/home/openchamber/.cargo/bin/skillz",
+			"args": []
+		}
+	},
+	"inputs": []
+}

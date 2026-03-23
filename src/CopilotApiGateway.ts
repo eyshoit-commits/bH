@@ -1698,6 +1698,17 @@ export class CopilotApiGateway implements vscode.Disposable {
 			return;
 		}
 
+		// List all skills (Phase 1 - read-only discovery)
+		if (req.method === 'GET' && url.pathname === '/v1/skills') {
+			const { getSkills } = await import('./skills/registry');
+			const skills = getSkills();
+			this.sendJson(res, 200, {
+				object: 'list',
+				data: skills
+			});
+			return;
+		}
+
 		// Get specific model
 		const modelMatch = url.pathname.match(/^\/v1\/models\/(.+)$/);
 		if (req.method === 'GET' && modelMatch) {

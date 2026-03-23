@@ -1,0 +1,3 @@
+- Decision: surface for skillsPath is exposed via githubCopilotApi.skills.path in VS Code WorkspaceConfiguration.
+- Reasoning: Keeps config surface aligned with VS Code extension patterns and allows environment-based overrides.
+- Precedence chosen: Environment variable takes precedence over VS Code setting, which takes precedence over the default.

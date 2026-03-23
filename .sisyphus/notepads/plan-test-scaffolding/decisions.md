@@ -1,0 +1,3 @@
+- Decision: Use existing TS test style (node:test) for compatibility with current codebase.
+- Decision: Structure tests with per-surface groups and fixed fixtures under tests/fixtures/skill_manifests.
+- Decision: Two happy-path + two edge-case tests per deliverable; fixtures validated via TypeScript compilation.

@@ -1,0 +1,21 @@
+SkillRegistry decisions & rationale
+- Interface sketch (in-memory surface only):
+  - interface SkillManifest { id: string; name: string; description?: string; version?: string; tags?: string[]; }
+  - interface SkillRegistry { loadSkillsFromDirectory(path: string): Promise<void>; getSkills(): SkillManifest[]; }
+  - Rationale: keeps surface simple, predictable, and testable; no IO in API surface beyond startup load.
+- Startup lifecycle (read-only surface):
+  - On startup, registry loads all SkillManifest files from a directory into an in-memory collection.
+  - No persistence beyond process memory; surface is immutable from the API consumer perspective.
+  - The in-memory list is served via API (GET /v1/skills) as a read-only snapshot.
+- Surfacing via API integration: 
+  - The plan is to expose the in-memory skills via GET /v1/skills, returning SkillManifest[].
+  - If necessary, a simple ETag/Last-Modified header could be used to hint cache validation, though no persistence is performed.
+- Compatibility requirements:
+  - Must align with Task 1 (interface sketch) and Task 2 (startup lifecycle) outputs.
+  - Ensure the SkillManifest usage is discoverable by the API surface without mutation.
+- Diagram (text):
+  - Startup -> Discovery (load from directory) -> In-memory registry (immutable surface) -> API GET /v1/skills -> Client.
+- Validation rules (at design time):
+  - Unique id across loaded manifests; manifest validation must pass for each item.
+  - No mutation at runtime; changes require a restart to reload new manifests.
+- Next actions (for implementation): implement a tiny registry class that adheres to this interface and wire to the API layer in a future task.

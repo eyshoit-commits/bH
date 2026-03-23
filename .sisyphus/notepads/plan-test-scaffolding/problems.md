@@ -1,0 +1,2 @@
+- Potential problem: TS tests may require ts-node or transpilation at runtime; ensure pretest compiles tests to dist/out before vscode-test runs.
+- Potential problem: Mocking IPC or VS Code API surfaces for Skill manifests may require stubs.

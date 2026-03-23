@@ -1,0 +1,15 @@
+DiscoverSkills interface prototype learnings
+- Located SkillManifest surface in src/skills/types.ts
+- Proposed surface signature: discoverSkills(directoryPath: string): Promise<SkillManifest[]>
+- Return type leverages existing SkillManifest interface from the codebase
+- Behavior notes:
+  - Empty directory -> returns []
+  - Directory with no valid manifests -> []
+  - Non-manifest files are ignored during discovery
+- Error semantics to document (surface-only):
+  - ERR_INVALID_DIRECTORY when path does not exist or is not a directory
+  - ERR_READ_DIRECTORY when the directory read fails due to IO errors
+  - ERR_PARSE_MANIFEST when a manifest.json/manifest.yaml fails to parse
+  - ERR_UNKNOWN for any other unexpected failure
+- Performance/caching notes: potential caching by directoryPath key; not implemented yet
+- Plan: keep surface as type declarations; actual IO to be implemented later

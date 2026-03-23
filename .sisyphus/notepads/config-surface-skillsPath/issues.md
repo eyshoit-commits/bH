@@ -1,0 +1,1 @@
+- No known issues yet. If path resolution fails in a workspace, consider adjusting the environment variable name or the VS Code setting key.

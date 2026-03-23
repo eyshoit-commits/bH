@@ -1,1 +1,10 @@
-{ "githubCopilotApi.audit.logRequestBodies": true }
+{
+  "githubCopilotApi.audit.logRequestBodies": true,
+  "githubCopilotApi.mcp.enabled": true,
+  "githubCopilotApi.mcp.servers": {
+    "skillz": {
+      "command": "/bin/bash",
+      "args": ["-c", "/home/openchamber/.cargo/bin/skillz"]
+    }
+  }
+}

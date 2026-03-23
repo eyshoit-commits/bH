@@ -1,0 +1,1 @@
+- None yet. Plan to record blockers encountered while drafting the test scaffolding.
