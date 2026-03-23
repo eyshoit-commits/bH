@@ -30,7 +30,7 @@ import { invokeSkillTool, ToolExecutionError } from './skills/runtime/invokeSkil
 
 const COPILOT_CHAT_EXTENSION_ID = 'GitHub.copilot-chat';
 const COPILOT_CHAT_SEARCH_QUERY = '@id:GitHub.copilot-chat';
-const SELECT_CHAT_MODELS_TIMEOUT_MS = 2000;
+const SELECT_CHAT_MODELS_TIMEOUT_MS = 10000;
 let cachedLanguageModels: vscode.LanguageModelChat[] = [];
 let lastLanguageModelsWarningAt = 0;
 
@@ -6614,11 +6614,13 @@ function getServerConfig(): ApiServerConfig {
 		.map(parseCustomProviderConfig)
 		.filter((provider): provider is CustomProviderConfig => provider !== null);
 
+	const defaultProviders = getDefaultLocalProviders();
+
 	return {
 		enabled, enableHttp, enableWebSocket, enableHttps, tlsCertPath, tlsKeyPath, host, port, maxConcurrentRequests,
 		defaultModel, apiKey, enableLogging, rateLimitPerMinute, defaultSystemPrompt,
 		redactionPatterns, ipAllowlist, requestTimeoutSeconds, maxPayloadSizeMb, maxConnectionsPerIp,
-		mcpEnabled, cloudflaredPath, customProviders
+		mcpEnabled, cloudflaredPath, customProviders: [...customProviders, ...defaultProviders]
 	};
 }
 
