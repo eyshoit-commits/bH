@@ -17,6 +17,11 @@ export function normalizeOpenAICompatiblePath(pathname: string): string {
 	if (!pathname || pathname === '/' || pathname === '/v1' || pathname.startsWith('/v1/')) {
 		return pathname || '/';
 	}
+	
+	// Special case for /global/event - should not be normalized
+	if (pathname === '/global/event') {
+		return pathname;
+	}
 
 	const exactAlias = EXACT_OPENAI_ROUTE_ALIASES[pathname];
 	if (exactAlias) {

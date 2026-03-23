@@ -1668,6 +1668,29 @@ export class CopilotApiGateway implements vscode.Disposable {
 			return;
 		}
 
+
+
+		// API version endpoint
+		if (req.method === 'GET' && url.pathname === '/api/version') {
+			this.sendJson(res, 200, {
+				version: this.getVersion(),
+				api_version: '1.0',
+				service: 'proxy'
+			});
+			return;
+		}
+
+		// Global event endpoint (SSE for real-time events)
+		if (req.method === 'GET' && url.pathname === '/global/event') {
+			res.writeHead(200, {
+				'Content-Type': 'text/event-stream',
+				'Cache-Control': 'no-cache',
+				'Connection': 'keep-alive'
+			});
+			res.write('data: ' + JSON.stringify({ type: 'connected', timestamp: new Date().toISOString() }) + '\n\n');
+			return;
+		}
+
 		// OpenAPI specification
 		if (req.method === 'GET' && url.pathname === '/openapi.json') {
 			this.sendJson(res, 200, this.getOpenApiSpec());
@@ -1760,13 +1783,46 @@ export class CopilotApiGateway implements vscode.Disposable {
 				throw new ApiError(400, error instanceof Error ? error.message : 'Invalid filters', 'invalid_param');
 			}
 
+			// Get skill-based tools from registry (respects filters)
 			const toolRegistry = getToolRegistry();
-			const tools = toolRegistry.list({
+			const skillTools = toolRegistry.list({
 				skillId: filters.skillId,
 				toolType: filters.toolType
 			});
-			const payload = buildToolsPayload(tools);
-			this.sendJson(res, 200, payload);
+
+			// Get MCP tools (no filtering support yet)
+			const mcpService = await this.ensureMcpService();
+			const mcpTools = mcpService ? await mcpService.getAllTools() : [];
+
+			// Combine both sources
+			const allTools = [
+				...skillTools.map(t => ({
+					type: 'function',
+					skillId: t.skillId,
+					function: {
+						name: t.name,
+						description: t.description,
+						parameters: t.inputSchema
+					}
+				})),
+				...mcpTools.map(t => ({
+					type: 'function',
+					server: t.serverName,
+					function: {
+						name: t.name,
+						description: t.description || '',
+						parameters: t.inputSchema || {}
+					}
+				}))
+			];
+
+			const payload = buildToolsPayload(skillTools); // Keep original format for skill tools
+			// But we need to include MCP tools too - rebuild payload manually
+			const combinedPayload = {
+				object: 'list',
+				data: allTools
+			};
+			this.sendJson(res, 200, combinedPayload);
 			return;
 		}
 
@@ -1802,25 +1858,6 @@ export class CopilotApiGateway implements vscode.Disposable {
 				throw new ApiError(404, `Model '${modelId}' not found`, 'not_found', 'model_not_found');
 			}
 			this.sendJson(res, 200, model);
-			return;
-		}
-
-		// List all available tools (MCP + VS Code built-in)
-		if (req.method === 'GET' && url.pathname === '/v1/tools') {
-			const mcpService = await this.ensureMcpService();
-			const tools = mcpService ? await mcpService.getAllTools() : [];
-			this.sendJson(res, 200, {
-				object: 'list',
-				data: tools.map(t => ({
-					type: 'function',
-					server: t.serverName,
-					function: {
-						name: t.name,
-						description: t.description || '',
-						parameters: t.inputSchema || {}
-					}
-				}))
-			});
 			return;
 		}
 
@@ -1912,17 +1949,27 @@ export class CopilotApiGateway implements vscode.Disposable {
 			if (body?.stream === true) {
 				await this.processStreamingChatCompletion(body, req, res, requestId, requestStart);
 			} else {
-				const response = await this.processChatCompletion(body, { source: 'http', endpoint: '/v1/chat/completions' }) as any;
-				this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
-					requestPayload: body,
-					responsePayload: response,
-					tokensIn: response?.usage?.prompt_tokens,
-					tokensOut: response?.usage?.completion_tokens,
-					model: body?.model,
-					requestHeaders: req.headers,
-					responseHeaders: res.getHeaders()
-				});
-				this.sendJson(res, 200, response);
+				try {
+					const response = await this.processChatCompletion(body, { source: 'http', endpoint: '/v1/chat/completions' }) as any;
+					this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+						requestPayload: body,
+						responsePayload: response,
+						tokensIn: response?.usage?.prompt_tokens,
+						tokensOut: response?.usage?.completion_tokens,
+						model: body?.model,
+						requestHeaders: req.headers,
+						responseHeaders: res.getHeaders()
+					});
+					this.sendJson(res, 200, response);
+				} catch (error: any) {
+					const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'server_error');
+					this.logRequest(requestId, req.method, url.pathname, apiError.status, Date.now() - requestStart, {
+						requestPayload: body,
+						error: apiError.message,
+						requestHeaders: req.headers
+					});
+					this.sendError(res, apiError);
+				}
 			}
 			return;
 		}
@@ -2104,17 +2151,27 @@ export class CopilotApiGateway implements vscode.Disposable {
 			if (body?.stream === true) {
 				await this.processStreamingChatCompletion(body, req, res, requestId, requestStart);
 			} else {
-				const response = await this.processChatCompletion(body, { source: 'http', endpoint: '/llama/v1/chat/completions' }) as any;
-				this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
-					requestPayload: body,
-					responsePayload: response,
-					tokensIn: response?.usage?.prompt_tokens,
-					tokensOut: response?.usage?.completion_tokens,
-					model: body?.model,
-					requestHeaders: req.headers,
-					responseHeaders: res.getHeaders()
-				});
-				this.sendJson(res, 200, response);
+				try {
+					const response = await this.processChatCompletion(body, { source: 'http', endpoint: '/llama/v1/chat/completions' }) as any;
+					this.logRequest(requestId, req.method, url.pathname, 200, Date.now() - requestStart, {
+						requestPayload: body,
+						responsePayload: response,
+						tokensIn: response?.usage?.prompt_tokens,
+						tokensOut: response?.usage?.completion_tokens,
+						model: body?.model,
+						requestHeaders: req.headers,
+						responseHeaders: res.getHeaders()
+					});
+					this.sendJson(res, 200, response);
+				} catch (error: any) {
+					const apiError = error instanceof ApiError ? error : new ApiError(500, error.message || 'Internal Server Error', 'server_error');
+					this.logRequest(requestId, req.method, url.pathname, apiError.status, Date.now() - requestStart, {
+						requestPayload: body,
+						error: apiError.message,
+						requestHeaders: req.headers
+					});
+					this.sendError(res, apiError);
+				}
 			}
 			return;
 		}
@@ -4863,7 +4920,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 		}
 	}
 
-	private sendJson(res: ServerResponse, status: number, body: unknown): void {
+	public sendJson(res: ServerResponse, status: number, body: unknown): void {
 		if (!res.headersSent) {
 			res.statusCode = status;
 			res.setHeader('Content-Type', 'application/json');
