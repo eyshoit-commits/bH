@@ -1,3 +1,6 @@
 node_modules
 .tsbuildinfo
 dist/
+
+# VS Code test binaries
+.vscode-test/
