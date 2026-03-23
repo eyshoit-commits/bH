@@ -1,4 +1,4 @@
-import type { CoreSkill, CoreSkillSource } from '../types.ts';
+import type { CoreSkill, CoreSkillSource } from '../types';
 
 export interface SkillIndexSnapshot {
   tokens: Record<string, string[]>;
@@ -51,7 +51,7 @@ export function buildSkillIndex(skills: CoreSkill[]): SkillIndexSnapshot {
   };
 }
 
-function tokenize(value: string | undefined): string[] {
+export function tokenize(value: string | undefined): string[] {
   if (!value?.trim()) {
     return [];
   }

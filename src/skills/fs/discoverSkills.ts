@@ -1,61 +1,95 @@
 import * as fs from 'fs/promises';
+import type { Dirent } from 'fs';
 import * as path from 'path';
-import { SkillManifest } from '../types';
+import type { CoreSkill } from '../types';
 import { readSkillManifest } from './readSkillManifest';
+import { resolveSkillPath } from '../config';
 
 export type DiscoverSkillsErrorCode =
-	| 'ERR_INVALID_DIRECTORY'
-	| 'ERR_READ_DIRECTORY'
-	| 'ERR_PARSE_MANIFEST'
-	| 'ERR_UNKNOWN';
+  | 'ERR_INVALID_DIRECTORY'
+  | 'ERR_READ_DIRECTORY';
 
 export interface DiscoverSkillsError extends Error {
-	code: DiscoverSkillsErrorCode;
-	directoryPath?: string;
-	manifestPath?: string;
+  code: DiscoverSkillsErrorCode;
+  directoryPath?: string;
 }
 
-async function isDirectory(filePath: string): Promise<boolean> {
-	try {
-		const stat = await fs.stat(filePath);
-		return stat.isDirectory();
-	} catch {
-		return false;
-	}
+function createError(message: string, code: DiscoverSkillsErrorCode, directoryPath?: string): DiscoverSkillsError {
+  const error = new Error(message) as DiscoverSkillsError;
+  error.code = code;
+  error.directoryPath = directoryPath;
+  return error;
 }
 
-export async function discoverSkills(directoryPath: string): Promise<SkillManifest[]> {
-	const isDir = await isDirectory(directoryPath);
-	if (!isDir) {
-		const error = new Error(`Invalid directory: ${directoryPath}`) as DiscoverSkillsError;
-		error.code = 'ERR_INVALID_DIRECTORY';
-		error.directoryPath = directoryPath;
-		throw error;
-	}
+type RejectionEntry = {
+  manifestPath: string;
+  reason: string;
+};
 
-	let entries: string[];
-	try {
-		entries = await fs.readdir(directoryPath);
-	} catch (err) {
-		const error = new Error(`Failed to read directory: ${directoryPath}`) as DiscoverSkillsError;
-		error.code = 'ERR_READ_DIRECTORY';
-		error.directoryPath = directoryPath;
-		throw error;
-	}
+const rejectionLog: RejectionEntry[] = [];
 
-	const manifests: SkillManifest[] = [];
-	for (const entry of entries) {
-		if (!entry.endsWith('.md')) {
-			continue;
-		}
-		const manifestPath = path.join(directoryPath, entry);
-		try {
-			const manifest = await readSkillManifest(manifestPath);
-			manifests.push(manifest);
-		} catch (err) {
-			continue;
-		}
-	}
+export function getDiscoveryRejections(): RejectionEntry[] {
+  return [...rejectionLog];
+}
 
-	return manifests;
+export function clearDiscoveryRejections(): void {
+  rejectionLog.length = 0;
+}
+
+function recordRejection(entry: RejectionEntry): void {
+  rejectionLog.push(entry);
+}
+
+export async function discoverSkills(directoryPath?: string): Promise<CoreSkill[]> {
+  const resolvedPath = directoryPath ?? resolveSkillPath();
+  let entries: Dirent[];
+  try {
+    const stats = await fs.stat(resolvedPath);
+    if (!stats.isDirectory()) {
+      throw createError(`Path is not a directory: ${resolvedPath}`, 'ERR_INVALID_DIRECTORY', resolvedPath);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      throw createError(`Directory not found: ${resolvedPath}`, 'ERR_INVALID_DIRECTORY', resolvedPath);
+    }
+    throw createError(`Failed to access directory: ${resolvedPath}`, 'ERR_INVALID_DIRECTORY', resolvedPath);
+  }
+
+  try {
+    entries = await fs.readdir(resolvedPath, { withFileTypes: true });
+  } catch {
+    throw createError(`Failed to read directory: ${resolvedPath}`, 'ERR_READ_DIRECTORY', resolvedPath);
+  }
+
+  const skillFiles = new Set<string>();
+  const rootManifest = path.join(resolvedPath, 'SKILL.md');
+  try {
+    await fs.access(rootManifest);
+    skillFiles.add(rootManifest);
+  } catch {
+    // ignore missing root manifest
+  }
+
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      skillFiles.add(path.join(resolvedPath, entry.name, 'SKILL.md'));
+    } else if (entry.isFile() && entry.name.toLowerCase() === 'skill.md') {
+      skillFiles.add(path.join(resolvedPath, entry.name));
+    }
+  }
+
+  const skills: CoreSkill[] = [];
+  for (const manifestPath of skillFiles) {
+    try {
+      const skill = await readSkillManifest(manifestPath);
+      skills.push(skill);
+    } catch (error) {
+      recordRejection({
+        manifestPath,
+        reason: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
+
+  return skills;
 }

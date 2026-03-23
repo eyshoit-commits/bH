@@ -1,8 +1,8 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-import type { CoreSkill } from '../types.ts';
-import type { SkillInstructions } from './loadSkillInstructions.ts';
+import type { CoreSkill } from '../types';
+import type { SkillInstructions } from './loadSkillInstructions';
 
 export interface ResolvedSkillResources {
 	scriptPaths: Record<string, string>;

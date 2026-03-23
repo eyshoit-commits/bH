@@ -1,10 +1,10 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-import type { CoreSkill } from '../skills/types.ts';
-import type { CoreTool, ToolRegistry, ToolRejection } from './toolRegistry.ts';
-import { ToolRegistryError } from './toolRegistry.ts';
-import { validateToolDefinition, type ToolDefinition } from './validateToolInput.ts';
+import type { CoreSkill } from '../skills/types';
+import type { CoreTool, ToolRegistry, ToolRejection } from './toolRegistry';
+import { ToolRegistryError } from './toolRegistry';
+import { validateToolDefinition, type ToolDefinition } from './validateToolInput';
 
 export interface RegisterSkillToolsResult {
 	registered: CoreTool[];

@@ -2638,8 +2638,8 @@ print(response.choices[0].message.content)\`;
                         setCustomProviderStatus('Name and Base URL are required.', true);
                         return;
                     }
-                    if (!provider.models.length) {
-                        setCustomProviderStatus('Add at least one model or fetch them first.', true);
+                    if (!provider.models.length && provider.autoDiscoverModels === false) {
+                        setCustomProviderStatus('Add at least one model or enable auto discovery.', true);
                         return;
                     }
                     vscode.postMessage({ type: 'saveCustomProvider', value: provider });

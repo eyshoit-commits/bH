@@ -1,5 +1,5 @@
-import type { CoreSkillSource } from '../types.ts';
-import type { SearchParams } from './searchSkills.ts';
+import type { CoreSkillSource } from '../types';
+import type { SearchParams } from './searchSkills';
 
 const VALID_SOURCES: CoreSkillSource[] = ['local', 'git', 'bundled', 'provider'];
 

@@ -1,4 +1,4 @@
-import type { CoreToolPreview, ToolType } from './toolRegistry.ts';
+import type { CoreToolPreview, ToolType } from './toolRegistry';
 
 export interface ToolsFilters {
 	skillId?: string;

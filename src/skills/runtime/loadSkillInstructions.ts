@@ -1,7 +1,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-import type { CoreSkill } from '../types.ts';
+import type { CoreSkill } from '../types';
 
 export type RuntimeStepType = 'knowledge' | 'script' | 'pipeline';
 

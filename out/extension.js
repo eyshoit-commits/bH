@@ -1,9 +1,11 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { CopilotApiGateway, ensureCopilotChatReady, getErrorMessage, normalizePrompt, selectChatModelsSafe } from './CopilotApiGateway';
 import { CopilotPanel } from './CopilotPanel';
 import { createDesktopShortcut } from './commands/createDesktopShortcut';
+import { loadSkillsFromDirectory } from './skills/registry';
 let gateway;
 export function activate(context) {
     const output = vscode.window.createOutputChannel('proxy');
@@ -106,7 +108,6 @@ Server is stopped. Click to start or manage.
         }
     };
     let wasRunning = false;
-    // Lazy Gateway Accessor
     const getGateway = async () => {
         if (gateway) {
             return gateway;
@@ -114,7 +115,19 @@ Server is stopped. Click to start or manage.
         const gw = new CopilotApiGateway(output, statusItem, context);
         gateway = gw;
         context.subscriptions.push(gw);
-        // Hook up listeners
+        try {
+            const skillsConfig = vscode.workspace.getConfiguration('githubCopilotApi.skills');
+            const skillsPath = skillsConfig.get('path', '.vscode/skills');
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (workspaceRoot && skillsPath) {
+                const fullPath = path.isAbsolute(skillsPath) ? skillsPath : path.join(workspaceRoot, skillsPath);
+                await loadSkillsFromDirectory(fullPath);
+                output.appendLine(`[Skills] Loaded from: ${fullPath}`);
+            }
+        }
+        catch (error) {
+            output.appendLine(`[Skills] Warning: Failed to load skills: ${error instanceof Error ? error.message : String(error)}`);
+        }
         context.subscriptions.push(gw.onDidChangeStatus(async () => {
             await updateStatusBar();
             // Notifications

@@ -1,98 +1,66 @@
-/**
- * Read skill manifest from filesystem.
- * Parses a markdown file with YAML frontmatter into a SkillManifest.
- */
-
 import * as fs from 'fs/promises';
-import * as path from 'path';
-import { SkillManifest } from '../types';
+import type { CoreSkill, CoreSkillManifest } from '../types';
+import { normalizeCoreSkill } from '../types';
 
-/**
- * Error codes for readSkillManifest failures.
- */
 export type ReadSkillManifestErrorCode =
-	| 'ERR_FILE_NOT_FOUND'
-	| 'ERR_READ_FILE'
-	| 'ERR_PARSE_FRONTMATTER'
-	| 'ERR_INVALID_MANIFEST';
+  | 'ERR_FILE_NOT_FOUND'
+  | 'ERR_READ_FILE'
+  | 'ERR_PARSE_FRONTMATTER'
+  | 'ERR_INVALID_MANIFEST';
 
 export interface ReadSkillManifestError extends Error {
-	code: ReadSkillManifestErrorCode;
-	manifestPath?: string;
+  code: ReadSkillManifestErrorCode;
+  manifestPath?: string;
 }
 
-/**
- * Read and parse a single skill manifest file.
- *
- * @param filePath - Absolute path to the manifest file (.md)
- * @returns Promise resolving to SkillManifest
- * @throws ReadSkillManifestError on failure
- */
-export async function readSkillManifest(filePath: string): Promise<SkillManifest> {
-	// Validate file exists
-	try {
-		await fs.access(filePath);
-	} catch {
-		const error = new Error(`Manifest file not found: ${filePath}`) as ReadSkillManifestError;
-		error.code = 'ERR_FILE_NOT_FOUND';
-		error.manifestPath = filePath;
-		throw error;
-	}
+function createError(message: string, code: ReadSkillManifestErrorCode, manifestPath?: string): ReadSkillManifestError {
+  const error = new Error(message) as ReadSkillManifestError;
+  error.code = code;
+  if (manifestPath) {
+    error.manifestPath = manifestPath;
+  }
+  return error;
+}
 
-	// Read file content
-	let content: string;
-	try {
-		content = await fs.readFile(filePath, 'utf-8');
-	} catch (err) {
-		const error = new Error(`Failed to read manifest: ${filePath}`) as ReadSkillManifestError;
-		error.code = 'ERR_READ_FILE';
-		error.manifestPath = filePath;
-		throw error;
-	}
+function parseFrontmatter(frontmatter: string): Record<string, string> {
+  return frontmatter.split(/\r?\n/).reduce<Record<string, string>>((acc, line) => {
+    const match = line.match(/^([\w-]+):\s*(.*)$/);
+    if (match) {
+      acc[match[1]] = match[2].trim();
+    }
+    return acc;
+  }, {});
+}
 
-	// Parse YAML frontmatter (--- delimited)
-	const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
-	if (!frontmatterMatch) {
-		const error = new Error(`No valid YAML frontmatter found in: ${filePath}`) as ReadSkillManifestError;
-		error.code = 'ERR_PARSE_FRONTMATTER';
-		error.manifestPath = filePath;
-		throw error;
-	}
+export async function readSkillManifest(filePath: string): Promise<CoreSkill> {
+  try {
+    await fs.access(filePath);
+  } catch {
+    throw createError(`Manifest file not found: ${filePath}`, 'ERR_FILE_NOT_FOUND', filePath);
+  }
 
-	// Parse frontmatter manually (simple key: value parser)
-	const frontmatter = frontmatterMatch[1];
-	const manifest: Partial<SkillManifest> = {};
+  let content: string;
+  try {
+    content = await fs.readFile(filePath, 'utf-8');
+  } catch {
+    throw createError(`Failed to read manifest: ${filePath}`, 'ERR_READ_FILE', filePath);
+  }
 
-	const requiredFields = ['id', 'name', 'version', 'description'];
-	for (const field of requiredFields) {
-		const regex = new RegExp(`^${field}:\\s*(.+)$`, 'm');
-		const match = frontmatter.match(regex);
-		if (!match) {
-			const error = new Error(`Missing required field "${field}" in: ${filePath}`) as ReadSkillManifestError;
-			error.code = 'ERR_INVALID_MANIFEST';
-			error.manifestPath = filePath;
-			throw error;
-		}
-		(manifest as Record<string, string>)[field] = match[1].trim();
-	}
+  const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!frontmatterMatch) {
+    throw createError(`No valid YAML frontmatter found in: ${filePath}`, 'ERR_PARSE_FRONTMATTER', filePath);
+  }
 
-	// Parse optional fields
-	const optionalFields = ['source', 'path'];
-	for (const field of optionalFields) {
-		const regex = new RegExp(`^${field}:\\s*(.+)$`, 'm');
-		const match = frontmatter.match(regex);
-		if (match) {
-			(manifest as Record<string, string>)[field] = match[1].trim();
-		}
-	}
+  const data = parseFrontmatter(frontmatterMatch[1]);
+  const manifest: Partial<CoreSkillManifest> & { path?: string } = {
+    ...data,
+    path: data.path ?? filePath
+  };
 
-	// Validate and return
-	if (!manifest.id || !manifest.name || !manifest.version || !manifest.description) {
-		const error = new Error(`Invalid manifest: missing required fields in ${filePath}`) as ReadSkillManifestError;
-		error.code = 'ERR_INVALID_MANIFEST';
-		error.manifestPath = filePath;
-		throw error;
-	}
-
-	return manifest as SkillManifest;
+  try {
+    return normalizeCoreSkill(manifest as CoreSkillManifest & Partial<CoreSkill>);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Invalid manifest';
+    throw createError(`Invalid manifest: ${message}`, 'ERR_INVALID_MANIFEST', filePath);
+  }
 }

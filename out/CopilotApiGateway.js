@@ -8,7 +8,16 @@ import * as path from 'path';
 import { AuditService } from './services/AuditService';
 import { normalizeOpenAICompatiblePath } from './openAiRouteAliases';
 import { buildResponsesCustomProviderChatPayload, extractChatCompletionTextContent, mapChatCompletionToResponsesApiResponse, } from './responsesCustomProviderBridge';
+import { mergeModels } from './gateway/model/mergeModels';
+import { normalizeModel } from './gateway/model/normalizeModel';
+import { validateModel } from './gateway/model/validateModel';
 import { parseJsonBody } from './jsonBodyParser';
+import { buildSkillIndex } from './skills/search/buildSkillIndex';
+import { searchSkills, SearchError } from './skills/search/searchSkills';
+import { parseSearchParams } from './skills/search/parseSearchParams';
+import { getToolRegistry } from './tools/registry';
+import { buildToolsPayload, parseToolExecutionBody, parseToolsFilters } from './tools/toolsApi';
+import { invokeSkillTool, ToolExecutionError } from './skills/runtime/invokeSkillTool';
 const COPILOT_CHAT_EXTENSION_ID = 'GitHub.copilot-chat';
 const COPILOT_CHAT_SEARCH_QUERY = '@id:GitHub.copilot-chat';
 const SELECT_CHAT_MODELS_TIMEOUT_MS = 2000;
@@ -47,11 +56,11 @@ export class ApiError extends Error {
     details;
     constructor(status, message, type, code, details) {
         super(message);
+        this.name = 'ApiError';
         this.status = status;
         this.type = type;
         this.code = code;
         this.details = details;
-        this.name = 'ApiError';
     }
 }
 // Default redaction patterns - disabled by default (opt-in)
@@ -1257,6 +1266,88 @@ export class CopilotApiGateway {
             });
             return;
         }
+        // List all skills (Phase 1 - read-only discovery)
+        if (req.method === 'GET' && url.pathname === '/v1/skills') {
+            const { getSkills } = await import('./skills/registry');
+            const skills = getSkills();
+            this.sendJson(res, 200, {
+                object: 'list',
+                data: skills
+            });
+            return;
+        }
+        // Search skills
+        if (req.method === 'GET' && url.pathname === '/v1/skills/search') {
+            let params;
+            try {
+                params = parseSearchParams(url.searchParams);
+            }
+            catch (error) {
+                throw new ApiError(400, error instanceof Error ? error.message : 'Invalid search parameters', 'invalid_param');
+            }
+            const { getSkills } = await import('./skills/registry');
+            const skills = getSkills();
+            const snapshot = buildSkillIndex(skills);
+            try {
+                const result = searchSkills(params, snapshot);
+                const payload = {
+                    skills: result.skills,
+                    total: result.total,
+                    tookMs: result.tookMs,
+                };
+                if (result.debug) {
+                    payload.debug = result.debug;
+                }
+                this.sendJson(res, 200, payload);
+                return;
+            }
+            catch (error) {
+                if (error instanceof SearchError) {
+                    throw new ApiError(400, error.message, 'invalid_param');
+                }
+                throw error;
+            }
+        }
+        // List tools
+        if (req.method === 'GET' && url.pathname === '/v1/tools') {
+            let filters;
+            try {
+                filters = parseToolsFilters(url.searchParams);
+            }
+            catch (error) {
+                throw new ApiError(400, error instanceof Error ? error.message : 'Invalid filters', 'invalid_param');
+            }
+            const toolRegistry = getToolRegistry();
+            const tools = toolRegistry.list({
+                skillId: filters.skillId,
+                toolType: filters.toolType
+            });
+            const payload = buildToolsPayload(tools);
+            this.sendJson(res, 200, payload);
+            return;
+        }
+        // Execute a single tool
+        if (req.method === 'POST' && url.pathname === '/v1/tools/execute') {
+            const body = await this.readJsonBody(req);
+            let payload;
+            try {
+                payload = parseToolExecutionBody(body);
+            }
+            catch (error) {
+                throw new ApiError(400, error instanceof Error ? error.message : 'Invalid payload', 'invalid_param');
+            }
+            try {
+                const result = await invokeSkillTool(payload.toolId, { input: payload.input, context: payload.context });
+                this.sendJson(res, 200, result);
+                return;
+            }
+            catch (error) {
+                if (error instanceof ToolExecutionError) {
+                    throw new ApiError(400, error.message, 'execution_error');
+                }
+                throw error;
+            }
+        }
         // Get specific model
         const modelMatch = url.pathname.match(/^\/v1\/models\/(.+)$/);
         if (req.method === 'GET' && modelMatch) {
@@ -1917,41 +2008,125 @@ export class CopilotApiGateway {
         }
     }
     async getAvailableModels() {
-        const now = Math.floor(Date.now() / 1000);
-        // Fetch ALL language models registered in VS Code, not just Copilot
-        const allModels = await selectChatModelsSafe(this.output);
-        const modelData = allModels.map(model => ({
-            id: model.id,
-            object: 'model',
-            created: now,
-            owned_by: model.vendor || 'unknown',
-            name: model.name,
-            family: model.family,
-            version: model.version,
-            max_input_tokens: model.maxInputTokens,
-            capabilities: {
-                chat_completion: true,
-                text_completion: true,
-                streaming: true,
-                token_counting: true
+        const rejections = [];
+        const vsCodeModels = await this.normalizeVsCodeModels(rejections);
+        const customProviderModels = await this.normalizeCustomProviderModels(rejections);
+        if (rejections.length > 0) {
+            this.logRejectedModels(rejections);
+        }
+        return mergeModels(vsCodeModels, customProviderModels);
+    }
+    async normalizeVsCodeModels(rejections) {
+        const models = await selectChatModelsSafe(this.output);
+        return this.normalizeModelList(models, model => ({
+            raw: {
+                id: model.id,
+                name: model.name,
+                family: model.family,
+                version: model.version,
+                maxInputTokens: model.maxInputTokens,
+                owned_by: model.vendor || 'vscode',
+                capabilities: {
+                    chat_completion: true,
+                    text_completion: true,
+                    streaming: true,
+                    token_counting: true
+                }
+            },
+            provider: 'vscode',
+            options: {
+                ownedBy: model.vendor || 'vscode',
+                name: model.name ?? model.id,
+                family: model.family ?? model.name ?? 'vscode',
+                version: model.version ?? 'vscode'
             }
-        }));
-        const customModels = (await this.getCustomProviderModels()).map(model => ({
-            id: model.id,
-            object: 'model',
-            created: now,
-            owned_by: model.provider.name,
-            name: model.rawModelId,
-            family: model.rawModelId,
-            version: 'custom-provider',
-            endpoint: model.provider.baseUrl,
-            capabilities: {
-                chat_completion: true,
-                text_completion: true,
-                streaming: true
+        }), rejections);
+    }
+    async normalizeCustomProviderModels(rejections) {
+        const models = await this.getCustomProviderModels();
+        return this.normalizeModelList(models, model => {
+            const providerLabel = `custom-${this.slugifyProviderName(model.provider.name)}`;
+            return {
+                raw: {
+                    id: model.id,
+                    name: model.rawModelId,
+                    family: model.rawModelId,
+                    version: 'custom-provider',
+                    endpoint: model.provider.baseUrl,
+                    owned_by: model.provider.name,
+                    capabilities: {
+                        chat_completion: true,
+                        text_completion: true,
+                        streaming: true
+                    }
+                },
+                provider: providerLabel,
+                options: {
+                    ownedBy: model.provider.name,
+                    name: model.rawModelId,
+                    family: model.rawModelId,
+                    version: 'custom-provider',
+                    endpoint: model.provider.baseUrl
+                }
+            };
+        }, rejections);
+    }
+    normalizeModelList(items, converter, rejections) {
+        const normalized = [];
+        for (const item of items) {
+            const { raw, provider, options } = converter(item);
+            const model = normalizeModel(raw, provider, options);
+            if (!model) {
+                rejections.push({
+                    provider,
+                    raw,
+                    normalized: null,
+                    reason: 'missing_id'
+                });
+                continue;
             }
-        }));
-        return [...modelData, ...customModels];
+            if (!validateModel(model)) {
+                rejections.push({
+                    provider,
+                    raw,
+                    normalized: model,
+                    reason: 'validation_error'
+                });
+                continue;
+            }
+            normalized.push(model);
+        }
+        return normalized;
+    }
+    logRejectedModels(rejections) {
+        for (const rejection of rejections) {
+            this.logInfo(`Rejected /v1/models entry from ${rejection.provider} (${rejection.reason}). Raw: ${this.truncateForLog(rejection.raw)} Normalized: ${this.truncateForLog(rejection.normalized)}`);
+        }
+    }
+    truncateForLog(value, maxLength = 400) {
+        try {
+            const candidate = JSON.stringify(value);
+            if (candidate.length > maxLength) {
+                return `${candidate.slice(0, maxLength)}…`;
+            }
+            return candidate;
+        }
+        catch (error) {
+            return `[unserializable: ${typeof error === 'string' ? error : 'error'}]`;
+        }
+    }
+    splitPrefixedModelId(modelId) {
+        if (!modelId) {
+            return { rawId: '' };
+        }
+        const colonIndex = modelId.indexOf(':');
+        if (colonIndex <= 0) {
+            return { rawId: modelId };
+        }
+        return {
+            provider: modelId.substring(0, colonIndex),
+            rawId: modelId.substring(colonIndex + 1)
+        };
     }
     async processStreamingChatCompletion(payload, req, res, logRequestId, logRequestStart) {
         let messages = this.normalizeChatMessages(payload);
@@ -3579,13 +3754,16 @@ export class CopilotApiGateway {
     }
     async findCustomProviderModel(requestedModel) {
         const models = await this.getCustomProviderModels();
-        const routedMatch = models.find(model => model.id === requestedModel);
-        if (routedMatch) {
-            return routedMatch;
-        }
-        const rawMatches = models.filter(model => model.rawModelId === requestedModel);
-        if (rawMatches.length === 1) {
-            return rawMatches[0];
+        const normalizedRequest = this.splitPrefixedModelId(requestedModel).rawId.toLowerCase();
+        if (normalizedRequest) {
+            const routedMatch = models.find(model => model.id.toLowerCase() === normalizedRequest);
+            if (routedMatch) {
+                return routedMatch;
+            }
+            const rawMatches = models.filter(model => model.rawModelId.toLowerCase() === normalizedRequest);
+            if (rawMatches.length === 1) {
+                return rawMatches[0];
+            }
         }
         return null;
     }
@@ -3958,14 +4136,18 @@ export class CopilotApiGateway {
         if (!availableModels || availableModels.length === 0) {
             return null;
         }
-        const requested = requestedModel.toLowerCase();
+        const parsed = this.splitPrefixedModelId(requestedModel);
+        const normalized = parsed.rawId.toLowerCase();
+        if (!normalized) {
+            return null;
+        }
         // 1. Exact match on model id
-        const exactMatch = availableModels.find(m => m.id.toLowerCase() === requested);
+        const exactMatch = availableModels.find(m => m.id.toLowerCase() === normalized);
         if (exactMatch) {
             return exactMatch;
         }
         // 2. Exact match on family (e.g., "gpt-4o" matches family "gpt-4o")
-        const familyMatch = availableModels.find(m => m.family?.toLowerCase() === requested);
+        const familyMatch = availableModels.find(m => m.family?.toLowerCase() === normalized);
         if (familyMatch) {
             return familyMatch;
         }

@@ -1,0 +1,21 @@
+# Phase 2 Search Task Plan
+
+## Summary
+Phase 2 delivers an in-memory index, a search endpoint, and stable ranking while keeping all execution inside the existing gateway core. The work is broken down per file so the coding LLM can implement each piece with clear acceptance criteria and tests.
+
+## Phase 2 Files & Tasks
+
+| File | Purpose | Acceptance Criteria | Test Cases |
+| --- | --- | --- | --- |
+| `src/skills/search/buildSkillIndex.ts` | Build and export a `SkillIndexSnapshot` that tokenizes `CoreSkill` metadata, stores inverted token-to-skill maps, and captures facet data (tags, categories, source, updatedAt). | - Snapshot exposes search-ready structures (token map, facet map, metadata lookup).<br>- Rebuilds deterministically from a `CoreSkill[]` input.<br>- Tokenization normalization is configurable (lowercase, trim, punctuation). | - Valid metadata yields expected tokens/tags.<br>- Duplicate tokens map to all relevant skills.<br>- Missing metadata (e.g., empty tags) falls back gracefully.<br>- Index stays empty when input list is empty. |
+| `src/skills/search/searchSkills.ts` | Query the latest `SkillIndexSnapshot`, apply `q`, `tags`, `categories`, `source`, `limit`, and `offset`, and return `CoreSkillPreview`s plus optional debug scoring data. | - Filters respect comma-separated tags/categories and support `source` equality.<br>- `limit`/`offset` clamp to valid ranges.<br>- When `q` is empty, returns either all or zero results based on config (choose one consistent behavior).<br>- Errors bubble as `ApiError` with status 400 when params are invalid. | - Query matches by token and facet.<br>- Pagination resets to empty when offset exceeds total.<br>- Missing snapshot returns `skills: []` without throwing.<br>- Invalid `limit` (zero/negative) returns 400. |
+| `src/skills/search/rankSkills.ts` | Assign a numeric score to each match (token hits, tag matches, category matches), sort by score, then by `updatedAt` descending, and provide a stable output array. | - Sorting keeps ties deterministic using `updatedAt` then `id`.<br>- Score metadata can optionally be returned for debugging/logging.<br>- Score weights are documented and adjustable via constants. | - Skills with more token hits outrank others.<br>- Tag/category matches increase score.<br>- Skills with identical token/tag counts sort by newer `updatedAt`.<br>- Stable ordering means repeated calls return same order for same inputs. |
+| `src/CopilotApiGateway.ts` (search handler section) | Wire `GET /v1/skills/search` to the search service, parse query params, and serialize the ranked `CoreSkillPreview`s. | - Endpoint validates params, calls `searchSkills`, and returns `{ skills, total, tookMs }` with HTTP 200.<br>- Uses the same `ApiError` pattern as other endpoints.<br>- Metrics/logging capture query/filter evidence for the future admin UI. | - Integration test hits `/v1/skills/search?q=test` and receives JSON.<br>- Query with invalid limit/offset returns 400.<br>- Hits against empty registry produce `{ skills: [], total: 0 }`. |
+| `src/skills/search/index.ts` (optional aggregator) | Expose a `SkillSearchService` that holds the current `SkillIndexSnapshot`, rebuilds it when the registry refreshes, and feeds `searchSkills`. This file is optional but keeps wiring tidy. | - Service exposes methods `refresh(coreSkills: CoreSkill[])` and `search(params)`.<br>- Consumers never access raw snapshots directly.<br>- The registry triggers `refresh` after Phase 1 discovery completes. | - Calling `refresh` twice with the same input results in identical snapshots.<br>- `search` without a prior refresh returns an empty set gracefully.<br>- Errors during refresh are logged through rejection log helpers. |
+
+## Testing Notes
+- Implement unit tests alongside each module using the existing test harness (`test/*.ts`). Keep tests deterministic and avoid mocking non-deterministic data (timestamps should be fixed via `new Date('2026-03-23T00:00:00Z')`).
+- API integration tests live next to `test` or `test2` directories; ensure the HTTP server is bootstrapped similarly to Phase 1 GET `/v1/skills` tests.
+
+## Handoff
+- Include new files in git and ensure `npm test` (or the existing test command) covers both unit and integration cases before claiming Phase 2 complete.

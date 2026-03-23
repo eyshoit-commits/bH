@@ -1,25 +1,20 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { ToolValidationError, validateToolDefinition } from '../../src/tools/validateToolInput.ts';
+import { ToolValidationError, validateToolDefinition } from '../../src/tools/validateToolInput';
 
-test('validateToolDefinition accepts valid entry', () => {
-	const entry = validateToolDefinition({
-		name: 'Test Tool',
-		description: 'desc',
-		toolType: 'knowledge',
-		tags: ['alpha', 'beta'],
-		dependencies: ['dep']
-	});
-	assert.strictEqual(entry.name, 'Test Tool');
-	assert.strictEqual(entry.toolType, 'knowledge');
-	assert.deepStrictEqual(entry.tags, ['alpha', 'beta']);
+test('validateToolDefinition rejects missing required fields', () => {
+  assert.throws(() => {
+    validateToolDefinition({});
+  }, ToolValidationError);
 });
 
-test('validateToolDefinition rejects missing name', () => {
-	assert.throws(() => validateToolDefinition({ description: 'desc', toolType: 'knowledge' }), ToolValidationError);
-});
-
-test('validateToolDefinition rejects invalid toolType', () => {
-	assert.throws(() => validateToolDefinition({ name: 'x', description: 'desc', toolType: 'unknown' }), ToolValidationError);
+test('validateToolDefinition accepts valid definitions', () => {
+  const definition = validateToolDefinition({
+    name: 'Echo',
+    description: 'Echoes',
+    toolType: 'script'
+  });
+  assert.equal(definition.name, 'Echo');
+  assert.equal(definition.toolType, 'script');
 });

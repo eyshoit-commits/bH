@@ -1772,7 +1772,7 @@ export class CopilotApiGateway implements vscode.Disposable {
 
 		// Execute a single tool
 		if (req.method === 'POST' && url.pathname === '/v1/tools/execute') {
-			const body = await parseJsonBody(req);
+			const body = await this.readJsonBody(req);
 			let payload;
 			try {
 				payload = parseToolExecutionBody(body);

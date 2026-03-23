@@ -116,7 +116,7 @@ Wave 4: [final wave]
 > Implementation + Test = ONE task. Never separate.
 > EVERY task MUST have: Agent Profile + Parallelization + QA Scenarios.
 
-- [ ] 1. Finalize SkillManifest schema in documentation
+- [x] 1. Finalize SkillManifest schema in documentation
 
   **What to do**: Write a precise, machine-readable schema for SkillManifest (id, name, version, description, optional fields)
   **Must NOT do**: Include mutable fields or runtime behavior in Phase 1

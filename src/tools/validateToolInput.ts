@@ -1,4 +1,4 @@
-import type { ToolType } from './toolRegistry.ts';
+import type { ToolType } from './toolRegistry';
 
 export interface ToolDefinition {
 	id?: string;

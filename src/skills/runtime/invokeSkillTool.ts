@@ -1,5 +1,5 @@
-import { getToolRegistry, resetToolRegistry } from '../../tools/registry.ts';
-import type { CoreTool } from '../../tools/toolRegistry.ts';
+import { getToolRegistry, resetToolRegistry } from '../../tools/registry';
+import type { CoreTool } from '../../tools/toolRegistry';
 
 export interface ToolExecutionOptions {
 	input: Record<string, unknown>;

@@ -1,7 +1,7 @@
-import type { CoreSkill, CoreSkillSource } from '../types.ts';
-import type { SkillIndexSnapshot } from './buildSkillIndex.ts';
-import { tokenize } from './buildSkillIndex.ts';
-import { rankSkills, type RankCandidate, type RankedSkill } from './rankSkills.ts';
+import type { CoreSkill, CoreSkillSource } from '../types';
+import type { SkillIndexSnapshot } from './buildSkillIndex';
+import { tokenize } from './buildSkillIndex';
+import { rankSkills, type RankCandidate, type RankedSkill } from './rankSkills';
 
 export interface SearchParams {
   query?: string;

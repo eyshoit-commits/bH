@@ -1,4 +1,4 @@
-import { ToolRegistry } from './toolRegistry.ts';
+import { ToolRegistry } from './toolRegistry';
 
 const registry = new ToolRegistry();
 
