@@ -94,8 +94,12 @@ export class ModelResolver {
 		return models
 			.filter(m => m.status === 'available')
 			.sort((a, b) => {
-				if (this.isHealthy(a.id) && !this.isHealthy(b.id)) return -1;
-				if (!this.isHealthy(a.id) && this.isHealthy(b.id)) return 1;
+				if (this.isHealthy(a.id) && !this.isHealthy(b.id)) {
+					return -1;
+				}
+				if (!this.isHealthy(a.id) && this.isHealthy(b.id)) {
+					return 1;
+				}
 				return a.id.localeCompare(b.id);
 			});
 	}
