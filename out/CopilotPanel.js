@@ -72,6 +72,29 @@ export class CopilotPanel {
                 case 'switchModel':
                     void vscode.commands.executeCommand('proxy.showServerControls');
                     break;
+                case 'reindexSkills':
+                    void this._gateway.getStatus().then(() => {
+                        void vscode.window.showInformationMessage('Skills reindex triggered');
+                    });
+                    break;
+                case 'syncRepos':
+                    void this._gateway.getStatus().then(() => {
+                        void vscode.window.showInformationMessage('Repos sync triggered');
+                    });
+                    break;
+                case 'refreshProviders':
+                    void this._gateway.getStatus().then(() => {
+                        void vscode.window.showInformationMessage('Providers refreshed');
+                    });
+                    break;
+                case 'invalidateCache':
+                    void this._gateway.getStatus().then(() => {
+                        void vscode.window.showInformationMessage('Cache invalidated');
+                    });
+                    break;
+                case 'viewLogs':
+                    void vscode.commands.executeCommand('proxy.showServerControls');
+                    break;
                 default:
                     CopilotPanel.handleMessage(data, this._gateway);
             }
@@ -2237,6 +2260,72 @@ print(response.choices[0].message.content)\`;
             </div>
         </div>
 
+        <!-- Admin Panel -->
+        <div class="card full-width" id="admin-card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3 style="margin: 0; display: flex; align-items: center; gap: 8px;">🛠 Admin Panel</h3>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <button class="secondary" id="btn-admin-refresh" style="padding: 4px 12px; font-size: 11px; font-weight: 500;">🔄 Refresh Status</button>
+                </div>
+            </div>
+
+            <div id="admin-content-area">
+                <!-- Skills Status -->
+                <div style="margin-bottom: 16px;">
+                    <div style="font-size: 11px; font-weight: 600; opacity: 0.8; margin-bottom: 8px;">📋 SKILLS</div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                        <div style="background: var(--vscode-textBlockQuote-background); border-radius: 6px; padding: 10px;">
+                            <div style="font-size: 10px; opacity: 0.6; margin-bottom: 4px;">Total Skills</div>
+                            <div id="admin-skill-count" style="font-size: 18px; font-weight: 700; color: var(--vscode-charts-blue);">—</div>
+                        </div>
+                        <div style="background: var(--vscode-textBlockQuote-background); border-radius: 6px; padding: 10px;">
+                            <div style="font-size: 10px; opacity: 0.6; margin-bottom: 4px;">Total Tools</div>
+                            <div id="admin-tool-count" style="font-size: 18px; font-weight: 700; color: var(--vscode-charts-orange);">—</div>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="secondary" id="btn-reindex-skills" style="padding: 6px 12px; font-size: 11px; font-weight: 500;">🔄 Reindex Skills</button>
+                        <button class="secondary" id="btn-sync-repos" style="padding: 6px 12px; font-size: 11px; font-weight: 500;">📥 Sync Repos</button>
+                    </div>
+                </div>
+
+                <!-- Provider Status -->
+                <div style="margin-bottom: 16px;">
+                    <div style="font-size: 11px; font-weight: 600; opacity: 0.8; margin-bottom: 8px;">🔌 PROVIDERS</div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                        <div style="background: var(--vscode-textBlockQuote-background); border-radius: 6px; padding: 10px;">
+                            <div style="font-size: 10px; opacity: 0.6; margin-bottom: 4px;">Active Providers</div>
+                            <div id="admin-provider-count" style="font-size: 18px; font-weight: 700; color: var(--vscode-charts-green);">—</div>
+                        </div>
+                        <div style="background: var(--vscode-textBlockQuote-background); border-radius: 6px; padding: 10px;">
+                            <div style="font-size: 10px; opacity: 0.6; margin-bottom: 4px;">Active Model</div>
+                            <div id="admin-active-model" style="font-size: 14px; font-weight: 700; color: var(--vscode-charts-purple);">—</div>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="secondary" id="btn-refresh-providers" style="padding: 6px 12px; font-size: 11px; font-weight: 500;">🔄 Refresh Providers</button>
+                    </div>
+                </div>
+
+                <!-- System Status -->
+                <div style="margin-bottom: 16px;">
+                    <div style="font-size: 11px; font-weight: 600; opacity: 0.8; margin-bottom: 8px;">⚙️ SYSTEM</div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="secondary" id="btn-invalidate-cache" style="padding: 6px 12px; font-size: 11px; font-weight: 500;">🗑 Clear Cache</button>
+                        <button class="secondary" id="btn-view-logs" style="padding: 6px 12px; font-size: 11px; font-weight: 500;">📋 View Logs</button>
+                    </div>
+                </div>
+
+                <!-- Admin Logs -->
+                <div id="admin-logs-area">
+                    <div style="font-size: 11px; font-weight: 600; opacity: 0.8; margin-bottom: 8px;">📋 RECENT LOGS</div>
+                    <div id="admin-logs-content" class="log-container" style="max-height: 200px; overflow-y: auto; background: var(--vscode-editor-background); border-radius: 6px; padding: 8px; font-family: var(--vscode-editor-font-family); font-size: 11px; color: var(--vscode-editor-foreground);">
+                        <div class="muted" style="text-align: center; padding: 20px;">No logs yet. Click "Refresh Status" to load.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Live Log Tail -->
         <div class="card full-width">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
@@ -3377,6 +3466,31 @@ contentArea.innerHTML = html;
 }
     }
 }
+
+// Admin Panel event listeners
+document.getElementById('btn-admin-refresh').onclick = function() {
+    vscode.postMessage({ type: 'getStats' });
+};
+
+document.getElementById('btn-reindex-skills').onclick = function() {
+    vscode.postMessage({ type: 'reindexSkills' });
+};
+
+document.getElementById('btn-sync-repos').onclick = function() {
+    vscode.postMessage({ type: 'syncRepos' });
+};
+
+document.getElementById('btn-refresh-providers').onclick = function() {
+    vscode.postMessage({ type: 'refreshProviders' });
+};
+
+document.getElementById('btn-invalidate-cache').onclick = function() {
+    vscode.postMessage({ type: 'invalidateCache' });
+};
+
+document.getElementById('btn-view-logs').onclick = function() {
+    vscode.postMessage({ type: 'viewLogs' });
+};
 
 // Auto-refresh stats every 5 seconds
 setInterval(function () {

@@ -1327,6 +1327,14 @@ export class CopilotApiGateway {
                 throw error;
             }
         }
+        // Admin endpoints
+        if (url.pathname.startsWith('/v1/admin/')) {
+            const { registerAdminEndpoints } = await import('./admin/adminEndpoints');
+            const handled = registerAdminEndpoints(this, req, res, url);
+            if (handled) {
+                return;
+            }
+        }
         // List tools
         if (req.method === 'GET' && url.pathname === '/v1/tools') {
             let filters;
@@ -1336,13 +1344,43 @@ export class CopilotApiGateway {
             catch (error) {
                 throw new ApiError(400, error instanceof Error ? error.message : 'Invalid filters', 'invalid_param');
             }
+            // Get skill-based tools from registry (respects filters)
             const toolRegistry = getToolRegistry();
-            const tools = toolRegistry.list({
+            const skillTools = toolRegistry.list({
                 skillId: filters.skillId,
                 toolType: filters.toolType
             });
-            const payload = buildToolsPayload(tools);
-            this.sendJson(res, 200, payload);
+            // Get MCP tools (no filtering support yet)
+            const mcpService = await this.ensureMcpService();
+            const mcpTools = mcpService ? await mcpService.getAllTools() : [];
+            // Combine both sources
+            const allTools = [
+                ...skillTools.map(t => ({
+                    type: 'function',
+                    skillId: t.skillId,
+                    function: {
+                        name: t.name,
+                        description: t.description,
+                        parameters: t.inputSchema
+                    }
+                })),
+                ...mcpTools.map(t => ({
+                    type: 'function',
+                    server: t.serverName,
+                    function: {
+                        name: t.name,
+                        description: t.description || '',
+                        parameters: t.inputSchema || {}
+                    }
+                }))
+            ];
+            const payload = buildToolsPayload(skillTools); // Keep original format for skill tools
+            // But we need to include MCP tools too - rebuild payload manually
+            const combinedPayload = {
+                object: 'list',
+                data: allTools
+            };
+            this.sendJson(res, 200, combinedPayload);
             return;
         }
         // Execute a single tool
@@ -1377,24 +1415,6 @@ export class CopilotApiGateway {
                 throw new ApiError(404, `Model '${modelId}' not found`, 'not_found', 'model_not_found');
             }
             this.sendJson(res, 200, model);
-            return;
-        }
-        // List all available tools (MCP + VS Code built-in)
-        if (req.method === 'GET' && url.pathname === '/v1/tools') {
-            const mcpService = await this.ensureMcpService();
-            const tools = mcpService ? await mcpService.getAllTools() : [];
-            this.sendJson(res, 200, {
-                object: 'list',
-                data: tools.map(t => ({
-                    type: 'function',
-                    server: t.serverName,
-                    function: {
-                        name: t.name,
-                        description: t.description || '',
-                        parameters: t.inputSchema || {}
-                    }
-                }))
-            });
             return;
         }
         // Call a specific tool
