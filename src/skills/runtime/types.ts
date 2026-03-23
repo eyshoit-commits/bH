@@ -17,3 +17,22 @@ export interface SkillInstructions {
 	steps: InstructionStep[];
 	updatedAt: string;
 }
+
+export interface ToolExecutionOptions {
+	input: Record<string, unknown>;
+	context?: Record<string, unknown>;
+}
+
+export interface ExecutionLog {
+	timestamp: string;
+	event: string;
+	detail?: string;
+}
+
+export interface ToolExecutionResult {
+	object: 'tool_execution';
+	toolId: string;
+	response: unknown;
+	logs: ExecutionLog[];
+	tookMs: number;
+}

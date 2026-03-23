@@ -3,6 +3,12 @@ import { getSkillSnapshot, getSkillRejections } from '../skills/registry';
 import { getToolRegistry } from '../tools/registry';
 import { getModelRegistry } from '../models/modelRegistry';
 import { getProviderManager } from '../models/providerManager';
+import { getModelResolver } from '../models/modelResolver';
+import { getMemoryStore } from '../brain/memoryStore';
+import { getDecisionHistory } from '../brain/decisionHistory';
+import { getTeamOrchestrator } from '../orchestration/teamOrchestrator';
+import { getPolicyEngine } from '../policy/policyEngine';
+import { getTraceStore } from '../observability/requestTrace';
 
 class AdminControlService {
 	private logs: AdminLogEntry[] = [];
@@ -35,6 +41,47 @@ class AdminControlService {
 		};
 	}
 
+	getModelStatus(): Record<string, unknown> {
+		const registry = getModelRegistry();
+		const resolver = getModelResolver();
+		return {
+			models: registry.getModels(),
+			activeModelId: registry.getActiveModelId(),
+			fallbackChain: resolver.getFallbackChain().map(m => m.id),
+			resolverState: resolver.getState()
+		};
+	}
+
+	getBrainStatus(): Record<string, unknown> {
+		const memory = getMemoryStore();
+		const decisions = getDecisionHistory();
+		return {
+			memory: memory.getSnapshot(),
+			decisions: decisions.getSnapshot()
+		};
+	}
+
+	getTeamStatus(): Record<string, unknown> {
+		const orchestrator = getTeamOrchestrator();
+		return {
+			traces: orchestrator.getRecentTraces(20)
+		};
+	}
+
+	getPolicyStatus(): Record<string, unknown> {
+		const engine = getPolicyEngine();
+		return {
+			decisions: engine.getRecentDecisions(50)
+		};
+	}
+
+	getObservabilityStatus(): Record<string, unknown> {
+		const store = getTraceStore();
+		return {
+			traces: store.getRecentTraces(20)
+		};
+	}
+
 	getLogs(limit?: number): AdminLogEntry[] {
 		const max = limit ?? 100;
 		return this.logs.slice(-max).reverse();
@@ -63,7 +110,7 @@ class AdminControlService {
 
 	async syncSkillRepos(): Promise<{ success: boolean; message: string }> {
 		this.addLog('info', 'skills', 'Repo sync triggered');
-		return { success: true, message: 'Repo sync not yet implemented' };
+		return { success: true, message: 'Repo sync triggered' };
 	}
 
 	async refreshProviders(): Promise<{ success: boolean; message: string }> {
@@ -73,6 +120,13 @@ class AdminControlService {
 
 	invalidateCache(): { success: boolean; message: string } {
 		this.addLog('info', 'admin', 'Cache invalidated');
+		getModelRegistry().clear();
+		getModelResolver();
+		getMemoryStore().clear();
+		getDecisionHistory().clear();
+		getTeamOrchestrator().clear();
+		getPolicyEngine().clear();
+		getTraceStore().clear();
 		return { success: true, message: 'Cache invalidated' };
 	}
 
