@@ -117,6 +117,10 @@ export class ToolRegistry {
 		return [...this.rejections];
 	}
 
+	get(toolId: string): CoreTool | undefined {
+		return this.toolsById.get(toolId);
+	}
+
 	recordRejection(entry: ToolRejection): void {
 		this.rejections.push(entry);
 	}
