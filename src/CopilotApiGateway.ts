@@ -6636,7 +6636,11 @@ function parseCustomProviderConfig(raw: unknown): CustomProviderConfig | null {
 			.map(value => value.trim())
 		: [];
 
-	if (!name || !baseUrl || models.length === 0) {
+	if (!name || !baseUrl) {
+		return null;
+	}
+
+	if (models.length === 0 && entry.autoDiscoverModels === false) {
 		return null;
 	}
 
