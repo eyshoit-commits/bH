@@ -9,6 +9,8 @@ import { getDecisionHistory } from '../brain/decisionHistory';
 import { getTeamOrchestrator } from '../orchestration/teamOrchestrator';
 import { getPolicyEngine } from '../policy/policyEngine';
 import { getTraceStore } from '../observability/requestTrace';
+import { syncAllRepos } from '../skills/repos/syncSkillRepo';
+
 
 class AdminControlService {
 	private logs: AdminLogEntry[] = [];
@@ -110,8 +112,31 @@ class AdminControlService {
 
 	async syncSkillRepos(): Promise<{ success: boolean; message: string }> {
 		this.addLog('info', 'skills', 'Repo sync triggered');
-		return { success: true, message: 'Repo sync triggered' };
+		try {
+	
+			const results = await syncAllRepos();
+			for (const result of results) {
+				if (result.success) {
+					this.addLog('info', 'skills', `Repo ${result.repo} synced: ${result.message}`);
+				} else {
+					this.addLog('error', 'skills', `Repo ${result.repo} sync failed: ${result.message}`);
+				}
+			}
+			// Simple duplicate detection based on repo names (could be extended to skill ID checks)
+			const names = results.map(r => r.repo);
+			const duplicates = names.filter((n, i) => names.indexOf(n) !== i);
+			if (duplicates.length > 0) {
+				this.addLog('warn', 'skills', `Duplicate repo names detected after sync: ${duplicates.join(', ')}`);
+			}
+			const summary = `Synced ${results.length} repos` + (duplicates.length ? `; duplicates: ${duplicates.join(', ')}` : '');
+			return { success: true, message: summary };
+		} catch (error: any) {
+			this.addLog('error', 'skills', `Sync failed: ${error.message}`);
+			return { success: false, message: error.message };
+		}
 	}
+
+
 
 	async refreshProviders(): Promise<{ success: boolean; message: string }> {
 		this.addLog('info', 'admin', 'Provider refresh triggered');

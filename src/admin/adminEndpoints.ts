@@ -55,13 +55,21 @@ export function registerAdminEndpoints(
 		return true;
 	}
 
-	// POST /v1/admin/cache/invalidate
-	if (method === 'POST' && path === '/v1/admin/cache/invalidate') {
-		const service = getAdminControlService();
-		const result = service.invalidateCache();
-		gateway.sendJson(res, 200, result);
-		return true;
-	}
+		// POST /v1/admin/cache/invalidate
+		if (method === 'POST' && path === '/v1/admin/cache/invalidate') {
+			const service = getAdminControlService();
+			const result = service.invalidateCache();
+			gateway.sendJson(res, 200, result);
+			return true;
+		}
+		
+		// POST /v1/admin/skills/sync
+		if (method === 'POST' && path === '/v1/admin/skills/sync') {
+			const service = getAdminControlService();
+			const result = await service.syncSkillRepos();
+			gateway.sendJson(res, result.success ? 200 : 500, result);
+			return true;
+		}
 
 	return false;
 }

@@ -6666,6 +6666,32 @@ function parseCustomProviderConfig(raw: unknown): CustomProviderConfig | null {
 	};
 }
 
+function getDefaultLocalProviders(): CustomProviderConfig[] {
+	const defaults: CustomProviderConfig[] = [];
+
+	defaults.push({
+		name: 'ollama',
+		baseUrl: 'http://localhost:11434/v1',
+		apiKey: '',
+		models: [],
+		headers: {},
+		enabled: true,
+		autoDiscoverModels: true
+	});
+
+	defaults.push({
+		name: 'nvidia-nim',
+		baseUrl: 'http://localhost:8000/v1',
+		apiKey: '',
+		models: [],
+		headers: {},
+		enabled: true,
+		autoDiscoverModels: true
+	});
+
+	return defaults;
+}
+
 export function getErrorMessage(error: unknown): string {
 	if (error instanceof Error && error.message) {
 		return error.message;
